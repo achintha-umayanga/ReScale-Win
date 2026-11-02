@@ -8,6 +8,9 @@
     <Nullable>enable</Nullable>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>ReScale</AssemblyName>
+    <RootNamespace>ReScale</RootNamespace>
   </PropertyGroup>
 
 </Project>
+

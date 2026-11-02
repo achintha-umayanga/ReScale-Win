@@ -12,7 +12,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-namespace WindowStateSaver;
+namespace ReScale;
 
 internal static class Program
 {
@@ -39,7 +39,7 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
-        using var mutex = new Mutex(true, "WindowStateSaver_GlobalDpiNormalizer_Mutex", out bool createdNew);
+        using var mutex = new Mutex(true, "ReScale_GlobalDpiNormalizer_Mutex", out bool createdNew);
         if (!createdNew)
         {
             MessageBox.Show("Window State Saver is already running in your system tray.", "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -47,7 +47,7 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        Log("WindowStateSaver started. Administrator: " + IsRunningAsAdmin());
+        Log("ReScale started. Administrator: " + IsRunningAsAdmin());
         LoadRules();
 
         _msgWindow = new MessageOnlyWindow();
@@ -565,7 +565,7 @@ internal static class Program
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", false);
-            return key?.GetValue("WindowStateSaver") != null;
+            return key?.GetValue("ReScale") != null;
         }
         catch { return false; }
     }
@@ -579,11 +579,11 @@ internal static class Program
             if (enable)
             {
                 string exePath = Environment.ProcessPath ?? Application.ExecutablePath;
-                key.SetValue("WindowStateSaver", $"\"{exePath}\"");
+                key.SetValue("ReScale", $"\"{exePath}\"");
             }
             else
             {
-                key.DeleteValue("WindowStateSaver", false);
+                key.DeleteValue("ReScale", false);
             }
         }
         catch { }

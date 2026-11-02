@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🪟 Window State Saver
+# 🪟 ReScale
 
 **Universal Multi-Monitor DPI Normalizer for Windows 10 & 11**
 
@@ -34,9 +34,9 @@ Windows 11 includes options like *"Remember window locations based on monitor co
 
 ---
 
-## 💡 The Solution: Window State Saver
+## 💡 The Solution: ReScale
 
-**Window State Saver** is an ultra-lightweight, event-driven background utility that automatically intercepts application launches and restores them to their **exact intended visual scale** on whichever monitor they spawn.
+**ReScale** is an ultra-lightweight, event-driven background utility that automatically intercepts application launches and restores them to their **exact intended visual scale** on whichever monitor they spawn.
 
 ```
 ┌─────────────────────────────────┐           ┌─────────────────────────────────┐
@@ -85,7 +85,7 @@ $$\text{Target Height} = \text{Saved Height} \times \left(\frac{\text{Current DP
 
 ### 1. Run Pre-Compiled Binary
 1. Clone or download this repository.
-2. Double-click **`Run-WindowStateSaver.bat`** (or execute `publish\WindowStateSaver.exe`).
+2. Double-click **`Run-ReScale.bat`** (or execute `publish\ReScale.exe`).
 3. Click **Yes** on the Windows UAC prompt (required to manage elevated windows like Task Manager).
 4. The tool will sit silently in your **Windows System Tray** (near the clock).
 
@@ -103,8 +103,8 @@ $$\text{Target Height} = \text{Saved Height} \times \left(\frac{\text{Current DP
 ### Build Steps
 ```powershell
 # Clone the repository
-git clone https://github.com/your-username/window-state-saver.git
-cd "window-state-saver"
+git clone https://github.com/your-username/rescale.git
+cd "rescale"
 
 # Restore dependencies
 dotnet restore
