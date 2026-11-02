@@ -334,20 +334,12 @@ internal static class Program
                     if (x < monInfo.rcWork.Left) x = monInfo.rcWork.Left;
                     if (y < monInfo.rcWork.Top) y = monInfo.rcWork.Top;
 
-                    // Use SWP_NOCOPYBITS so DWM discards stale bitmaps and forces full child XAML re-layout
+                    // Only adjust outer window bounds cleanly. Let the app's internal engine reflow itself naturally.
                     bool ok = WinApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, targetW, targetH,
-                        WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE | WinApi.SWP_FRAMECHANGED | WinApi.SWP_NOCOPYBITS);
+                        WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
 
                     if (ok)
                     {
-                        // Invalidate and force immediate redraw of all child controls & XAML islands
-                        WinApi.RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero,
-                            WinApi.RDW_INVALIDATE | WinApi.RDW_ALLCHILDREN | WinApi.RDW_UPDATENOW | WinApi.RDW_FRAME | WinApi.RDW_ERASE);
-
-                        // Notify window of size change to reflow XAML grid columns
-                        IntPtr lParam = (IntPtr)((targetH << 16) | (targetW & 0xFFFF));
-                        WinApi.PostMessage(hwnd, WinApi.WM_SIZE, (IntPtr)WinApi.SIZE_RESTORED, lParam);
-
                         Log($"[SUCCESS] Resized {procName} from {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {dpiRatio:F2})");
                     }
                     else
