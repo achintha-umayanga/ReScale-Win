@@ -275,11 +275,9 @@ internal static class Program
     {
         Task.Run(async () =>
         {
-            await Task.Delay(40);
-            if (!WinApi.IsWindow(hwnd)) return;
-            NormalizeWindowDpi(hwnd, force: false);
-
-            await Task.Delay(120);
+            // Give XAML Island apps (File Explorer, Task Manager) enough time (250ms)
+            // to finish initializing their visual tree and grid columns before resizing
+            await Task.Delay(250);
             if (!WinApi.IsWindow(hwnd)) return;
             NormalizeWindowDpi(hwnd, force: false);
 
@@ -336,21 +334,28 @@ internal static class Program
                     if (x < monInfo.rcWork.Left) x = monInfo.rcWork.Left;
                     if (y < monInfo.rcWork.Top) y = monInfo.rcWork.Top;
 
+                    // Use SWP_NOCOPYBITS so DWM discards stale bitmaps and forces full child XAML re-layout
                     bool ok = WinApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, targetW, targetH,
-                        WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE | WinApi.SWP_FRAMECHANGED);
+                        WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE | WinApi.SWP_FRAMECHANGED | WinApi.SWP_NOCOPYBITS);
 
-                    if (!ok)
+                    if (ok)
+                    {
+                        // Invalidate and force immediate redraw of all child controls & XAML islands
+                        WinApi.RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero,
+                            WinApi.RDW_INVALIDATE | WinApi.RDW_ALLCHILDREN | WinApi.RDW_UPDATENOW | WinApi.RDW_FRAME | WinApi.RDW_ERASE);
+
+                        // Notify window of size change to reflow XAML grid columns
+                        IntPtr lParam = (IntPtr)((targetH << 16) | (targetW & 0xFFFF));
+                        WinApi.PostMessage(hwnd, WinApi.WM_SIZE, (IntPtr)WinApi.SIZE_RESTORED, lParam);
+
+                        Log($"[SUCCESS] Resized {procName} from {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {dpiRatio:F2})");
+                    }
+                    else
                     {
                         uint err = WinApi.GetLastError();
                         Log($"[WARN] SetWindowPos failed for {procName} (Error: {err})");
                     }
-                    else
-                    {
-                        Log($"[SUCCESS] Resized {procName} from {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {dpiRatio:F2})");
-                    }
 
-                    wp.rcNormalPosition = new WinApi.RECT { Left = x, Top = y, Right = x + targetW, Bottom = y + targetH };
-                    WinApi.SetWindowPlacement(hwnd, ref wp);
                     return ok;
                 }
             }
@@ -705,12 +710,22 @@ internal static class WinApi
     public const uint WINEVENT_OUTOFCONTEXT = 0;
     public const uint WINEVENT_SKIPOWNPROCESS = 2;
 
+    public const int WM_SIZE = 0x0005;
+    public const int SIZE_RESTORED = 0;
+
     public const int GWL_EXSTYLE = -20;
     public const int WS_EX_TOOLWINDOW = 0x00000080;
 
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
     public const uint SWP_FRAMECHANGED = 0x0020;
+    public const uint SWP_NOCOPYBITS = 0x0100;
+
+    public const uint RDW_INVALIDATE = 0x0001;
+    public const uint RDW_ERASE = 0x0004;
+    public const uint RDW_ALLCHILDREN = 0x0080;
+    public const uint RDW_UPDATENOW = 0x0100;
+    public const uint RDW_FRAME = 0x0400;
 
     public const int SW_SHOWNORMAL = 1;
     public const int SW_SHOWMAXIMIZED = 3;
@@ -765,6 +780,8 @@ internal static class WinApi
     [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
     [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+    [DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
     [DllImport("kernel32.dll")] public static extern uint GetLastError();
 }
