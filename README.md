@@ -8,7 +8,6 @@
 
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D6?style=flat-square&logo=windows)](https://microsoft.com)
 [![Framework](https://img.shields.io/badge/.NET-10.0-512BD4?style=flat-square&logo=dotnet)](https://dotnet.microsoft.com/)
-[![Architecture](https://img.shields.io/badge/Arch-x64-informational?style=flat-square)](#)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 </div>
@@ -103,7 +102,7 @@ $$\text{Target Height} = \text{Saved Height} \times \left(\frac{\text{Current DP
 ### Build Steps
 ```powershell
 # Clone the repository
-git clone https://github.com/your-username/rescale.git
+git clone https://github.com/achintha-umayanga/ReScale.git
 cd "rescale"
 
 # Restore dependencies
