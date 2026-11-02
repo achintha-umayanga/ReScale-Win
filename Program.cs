@@ -42,7 +42,7 @@ internal static class Program
         using var mutex = new Mutex(true, "ReScale_GlobalDpiNormalizer_Mutex", out bool createdNew);
         if (!createdNew)
         {
-            MessageBox.Show("Window State Saver is already running in your system tray.", "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("ReScale is already running in your system tray.", "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -116,7 +116,7 @@ internal static class Program
         _trayMenu = new ContextMenuStrip();
 
         string adminStatus = IsRunningAsAdmin() ? "(Admin)" : "(Standard)";
-        var header = new ToolStripMenuItem($"● Window State Saver {adminStatus}")
+        var header = new ToolStripMenuItem($"● ReScale {adminStatus}")
         {
             Font = new Font(_trayMenu.Font, FontStyle.Bold),
             Enabled = false
@@ -130,14 +130,14 @@ internal static class Program
             if (hwnd != IntPtr.Zero)
             {
                 bool res = NormalizeWindowDpi(hwnd, force: true);
-                _trayIcon?.ShowBalloonTip(1000, "Window State Saver", res ? "Normalized active window size." : "Window already matches active monitor.", ToolTipIcon.Info);
+                _trayIcon?.ShowBalloonTip(1000, "ReScale", res ? "Normalized active window size." : "Window already matches active monitor.", ToolTipIcon.Info);
             }
         });
 
         _trayMenu.Items.Add("Normalize All Open Windows (Ctrl+Alt+A)", null, (s, e) =>
         {
             int count = NormalizeAllWindows();
-            _trayIcon?.ShowBalloonTip(1200, "Window State Saver", $"Checked open windows ({count} scaled).", ToolTipIcon.Info);
+            _trayIcon?.ShowBalloonTip(1200, "ReScale", $"Checked open windows ({count} scaled).", ToolTipIcon.Info);
         });
 
         _trayMenu.Items.Add(new ToolStripSeparator());
@@ -181,7 +181,7 @@ internal static class Program
             _rules.Clear();
             SaveRules();
             InitialScanOpenWindows();
-            _trayIcon?.ShowBalloonTip(1200, "Window State Saver", "Cleared learned memory. Re-learning current sizes.", ToolTipIcon.Info);
+            _trayIcon?.ShowBalloonTip(1200, "ReScale", "Cleared learned memory. Re-learning current sizes.", ToolTipIcon.Info);
         });
 
         _trayMenu.Items.Add(new ToolStripSeparator());
@@ -191,14 +191,14 @@ internal static class Program
         {
             Icon = SystemIcons.Application,
             ContextMenuStrip = _trayMenu,
-            Text = $"Window State Saver {adminStatus}",
+            Text = $"ReScale {adminStatus}",
             Visible = true
         };
 
         _trayIcon.DoubleClick += (s, e) =>
         {
             int count = NormalizeAllWindows();
-            _trayIcon.ShowBalloonTip(1200, "Window State Saver", $"Checked windows ({count} scaled).", ToolTipIcon.Info);
+            _trayIcon.ShowBalloonTip(1200, "ReScale", $"Checked windows ({count} scaled).", ToolTipIcon.Info);
         };
     }
 
@@ -611,13 +611,13 @@ internal static class Program
                     if (fg != IntPtr.Zero)
                     {
                         NormalizeWindowDpi(fg, force: true);
-                        _trayIcon?.ShowBalloonTip(1000, "Window State Saver", "Normalized active window.", ToolTipIcon.Info);
+                        _trayIcon?.ShowBalloonTip(1000, "ReScale", "Normalized active window.", ToolTipIcon.Info);
                     }
                 }
                 else if (id == HOTKEY_ID_ALL)
                 {
                     int c = NormalizeAllWindows();
-                    _trayIcon?.ShowBalloonTip(1200, "Window State Saver", $"Normalized {c} windows.", ToolTipIcon.Info);
+                    _trayIcon?.ShowBalloonTip(1200, "ReScale", $"Normalized {c} windows.", ToolTipIcon.Info);
                 }
             }
 

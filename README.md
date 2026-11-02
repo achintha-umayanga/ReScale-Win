@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🪟 ReScale
+<img src="assets/logo.png" width="110" height="110" alt="ReScale Logo" />
+
+# ReScale
 
 **Universal Multi-Monitor DPI Normalizer for Windows 10 & 11**
 
