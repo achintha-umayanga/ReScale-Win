@@ -20,10 +20,8 @@ internal static class Program
     private static ContextMenuStrip? _trayMenu;
     private static IntPtr _hookMoveSize = IntPtr.Zero;
     private static IntPtr _hookShow = IntPtr.Zero;
-    private static IntPtr _hookForeground = IntPtr.Zero;
     private static WinApi.WinEventDelegate? _moveSizeDelegate;
     private static WinApi.WinEventDelegate? _showDelegate;
-    private static WinApi.WinEventDelegate? _foregroundDelegate;
     private static MessageOnlyWindow? _msgWindow;
 
     // ProcessName -> Saved Window Dimensions & DPI
@@ -32,8 +30,8 @@ internal static class Program
     private static readonly string ConfigPath = Path.Combine(AppDir, "window_dpi_rules.json");
     private static readonly string LogPath = Path.Combine(AppDir, "activity.log");
 
-    // Tracks windows normalized within the last 2 seconds to avoid rapid loops: hwnd -> timestamp
-    private static readonly ConcurrentDictionary<IntPtr, long> _lastNormalizedTicks = new();
+    // Tracks windows already handled on launch to prevent double-resizing: hwnd -> true
+    private static readonly ConcurrentDictionary<IntPtr, bool> _handledOnShow = new();
 
     private const int HOTKEY_ID_ACTIVE = 9001;
     private const int HOTKEY_ID_ALL = 9002;
@@ -60,7 +58,6 @@ internal static class Program
 
         _moveSizeDelegate = OnMoveSizeEnd;
         _showDelegate = OnWindowShow;
-        _foregroundDelegate = OnForegroundChanged;
 
         // Hook when user finishes moving or resizing: EVENT_SYSTEM_MOVESIZEEND = 0x000B
         _hookMoveSize = WinApi.SetWinEventHook(
@@ -74,15 +71,9 @@ internal static class Program
             IntPtr.Zero, _showDelegate, 0, 0,
             WinApi.WINEVENT_OUTOFCONTEXT | WinApi.WINEVENT_SKIPOWNPROCESS);
 
-        // Hook foreground change: EVENT_SYSTEM_FOREGROUND = 0x0003
-        _hookForeground = WinApi.SetWinEventHook(
-            WinApi.EVENT_SYSTEM_FOREGROUND, WinApi.EVENT_SYSTEM_FOREGROUND,
-            IntPtr.Zero, _foregroundDelegate, 0, 0,
-            WinApi.WINEVENT_OUTOFCONTEXT | WinApi.WINEVENT_SKIPOWNPROCESS);
-
         SetupTrayIcon();
 
-        // Scan existing open windows on launch
+        // Learn sizes of existing open windows without altering them
         InitialScanOpenWindows();
 
         Application.Run();
@@ -91,7 +82,6 @@ internal static class Program
         SaveRules();
         if (_hookMoveSize != IntPtr.Zero) WinApi.UnhookWinEvent(_hookMoveSize);
         if (_hookShow != IntPtr.Zero) WinApi.UnhookWinEvent(_hookShow);
-        if (_hookForeground != IntPtr.Zero) WinApi.UnhookWinEvent(_hookForeground);
         if (_msgWindow != null)
         {
             WinApi.UnregisterHotKey(_msgWindow.Handle, HOTKEY_ID_ACTIVE);
@@ -140,14 +130,14 @@ internal static class Program
             if (hwnd != IntPtr.Zero)
             {
                 bool res = NormalizeWindowDpi(hwnd, force: true);
-                _trayIcon?.ShowBalloonTip(1000, "Window State Saver", res ? "Normalized active window size." : "Window is already normalized.", ToolTipIcon.Info);
+                _trayIcon?.ShowBalloonTip(1000, "Window State Saver", res ? "Normalized active window size." : "Window already matches active monitor.", ToolTipIcon.Info);
             }
         });
 
         _trayMenu.Items.Add("Normalize All Open Windows (Ctrl+Alt+A)", null, (s, e) =>
         {
             int count = NormalizeAllWindows();
-            _trayIcon?.ShowBalloonTip(1200, "Window State Saver", $"Normalized {count} open windows across monitors.", ToolTipIcon.Info);
+            _trayIcon?.ShowBalloonTip(1200, "Window State Saver", $"Checked open windows ({count} scaled).", ToolTipIcon.Info);
         });
 
         _trayMenu.Items.Add(new ToolStripSeparator());
@@ -208,10 +198,14 @@ internal static class Program
         _trayIcon.DoubleClick += (s, e) =>
         {
             int count = NormalizeAllWindows();
-            _trayIcon.ShowBalloonTip(1200, "Window State Saver", $"Normalized {count} open windows.", ToolTipIcon.Info);
+            _trayIcon.ShowBalloonTip(1200, "Window State Saver", $"Checked windows ({count} scaled).", ToolTipIcon.Info);
         };
     }
 
+    /// <summary>
+    /// Event: User manually moved or resized a window.
+    /// Record the window's physical dimensions along with the exact DPI of the monitor it sits on.
+    /// </summary>
     private static void OnMoveSizeEnd(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
         if (idObject != 0 || hwnd == IntPtr.Zero || !IsCandidateAppWindow(hwnd)) return;
@@ -241,50 +235,38 @@ internal static class Program
                         SavedDpi = dpi,
                         LastUpdatedUtc = DateTime.UtcNow
                     };
-                    Log($"Saved size for {procName}: {w}x{h} on DPI {dpi}");
+                    Log($"Learned size for {procName}: {w}x{h} on DPI {dpi}");
                     SaveRulesDebounced();
                 }
             }
         }
-        else if (wp.showCmd == WinApi.SW_SHOWMAXIMIZED)
-        {
-            EnsureMaximizedWindowHasCorrectRestoreDownRect(hwnd, procName, monitor, dpi);
-        }
     }
 
+    /// <summary>
+    /// Event: A window is opened / created.
+    /// Only triggers on initial window launch.
+    /// </summary>
     private static void OnWindowShow(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
         if (idObject != 0 || hwnd == IntPtr.Zero || !IsCandidateAppWindow(hwnd)) return;
-        NormalizeWindowDpiAsync(hwnd);
-    }
 
-    private static void OnForegroundChanged(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
-    {
-        if (idObject != 0 || hwnd == IntPtr.Zero || !IsCandidateAppWindow(hwnd)) return;
-
-        long now = Environment.TickCount64;
-        if (_lastNormalizedTicks.TryGetValue(hwnd, out long last) && (now - last < 2500))
+        if (_handledOnShow.TryAdd(hwnd, true))
         {
-            return;
+            Task.Run(async () =>
+            {
+                // Give window a moment to finish initial launch painting
+                await Task.Delay(200);
+                if (!WinApi.IsWindow(hwnd)) return;
+                NormalizeWindowDpi(hwnd, force: false);
+            });
         }
-
-        NormalizeWindowDpiAsync(hwnd);
     }
 
-    private static void NormalizeWindowDpiAsync(IntPtr hwnd)
-    {
-        Task.Run(async () =>
-        {
-            // Give XAML Island apps (File Explorer, Task Manager) enough time (250ms)
-            // to finish initializing their visual tree and grid columns before resizing
-            await Task.Delay(250);
-            if (!WinApi.IsWindow(hwnd)) return;
-            NormalizeWindowDpi(hwnd, force: false);
-
-            _lastNormalizedTicks[hwnd] = Environment.TickCount64;
-        });
-    }
-
+    /// <summary>
+    /// Checks if a window opened on a monitor with a DIFFERENT DPI than where it was saved.
+    /// ONLY resizes if there is an actual DPI mismatch (e.g. saved on 96 DPI, opened on 144 DPI).
+    /// If it is on the same DPI, it leaves the window completely untouched!
+    /// </summary>
     public static bool NormalizeWindowDpi(IntPtr hwnd, bool force)
     {
         if (!IsCandidateAppWindow(hwnd)) return false;
@@ -294,6 +276,9 @@ internal static class Program
 
         var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
         if (!WinApi.GetWindowPlacement(hwnd, ref wp)) return false;
+
+        // Only handle normal (restored down) windows
+        if (wp.showCmd != WinApi.SW_SHOWNORMAL) return false;
 
         IntPtr monitor = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
         uint currentDpi = GetMonitorDpi(monitor);
@@ -307,6 +292,15 @@ internal static class Program
 
         if (_rules.TryGetValue(procName, out var rule))
         {
+            // CRITICAL CHECK:
+            // If the window is on the SAME DPI monitor where it was saved, DO NOT TOUCH IT!
+            // Let the window and Windows manage its natural size and internal layout.
+            if (!force && currentDpi == rule.SavedDpi)
+            {
+                return false;
+            }
+
+            // An actual DPI change occurred (e.g. saved on 96 DPI, opened on 144 DPI)!
             double dpiRatio = (double)currentDpi / (rule.SavedDpi > 0 ? rule.SavedDpi : 96);
 
             int targetW = (int)Math.Round(rule.SavedWidth * dpiRatio);
@@ -315,106 +309,72 @@ internal static class Program
             targetW = Math.Min(targetW, workW - 20);
             targetH = Math.Min(targetH, workH - 20);
 
-            if (wp.showCmd == WinApi.SW_SHOWNORMAL)
+            if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect)) return false;
+            int curW = currentRect.Right - currentRect.Left;
+            int curH = currentRect.Bottom - currentRect.Top;
+
+            double diffW = Math.Abs(curW - targetW) / (double)targetW;
+            double diffH = Math.Abs(curH - targetH) / (double)targetH;
+
+            // Only adjust if the window size differs meaningfully from target scaled size
+            if (force || diffW > 0.08 || diffH > 0.08)
             {
-                if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect)) return false;
-                int curW = currentRect.Right - currentRect.Left;
-                int curH = currentRect.Bottom - currentRect.Top;
+                int x = currentRect.Left;
+                int y = currentRect.Top;
 
-                double diffW = Math.Abs(curW - targetW) / (double)targetW;
-                double diffH = Math.Abs(curH - targetH) / (double)targetH;
+                if (x + targetW > monInfo.rcWork.Right) x = monInfo.rcWork.Right - targetW;
+                if (y + targetH > monInfo.rcWork.Bottom) y = monInfo.rcWork.Bottom - targetH;
+                if (x < monInfo.rcWork.Left) x = monInfo.rcWork.Left;
+                if (y < monInfo.rcWork.Top) y = monInfo.rcWork.Top;
 
-                if (force || diffW > 0.08 || diffH > 0.08)
+                // Adjust ONLY the outer window size cleanly.
+                // Do not post fake messages. Let Windows automatically adjust internal structures.
+                bool ok = WinApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, targetW, targetH,
+                    WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
+
+                if (ok)
                 {
-                    int x = currentRect.Left;
-                    int y = currentRect.Top;
+                    // Calibrate rule to the new monitor DPI so it stays untouched while on this monitor
+                    rule.SavedWidth = targetW;
+                    rule.SavedHeight = targetH;
+                    rule.SavedDpi = currentDpi;
+                    rule.LastUpdatedUtc = DateTime.UtcNow;
+                    SaveRulesDebounced();
 
-                    if (x + targetW > monInfo.rcWork.Right) x = monInfo.rcWork.Right - targetW;
-                    if (y + targetH > monInfo.rcWork.Bottom) y = monInfo.rcWork.Bottom - targetH;
-                    if (x < monInfo.rcWork.Left) x = monInfo.rcWork.Left;
-                    if (y < monInfo.rcWork.Top) y = monInfo.rcWork.Top;
-
-                    // Only adjust outer window bounds cleanly. Let the app's internal engine reflow itself naturally.
-                    bool ok = WinApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, targetW, targetH,
-                        WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
-
-                    if (ok)
-                    {
-                        Log($"[SUCCESS] Resized {procName} from {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {dpiRatio:F2})");
-                    }
-                    else
-                    {
-                        uint err = WinApi.GetLastError();
-                        Log($"[WARN] SetWindowPos failed for {procName} (Error: {err})");
-                    }
-
-                    return ok;
+                    Log($"[SUCCESS] Scaled {procName} for DPI change: {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {dpiRatio:F2})");
                 }
-            }
-            else if (wp.showCmd == WinApi.SW_SHOWMAXIMIZED)
-            {
-                EnsureMaximizedWindowHasCorrectRestoreDownRect(hwnd, procName, monitor, currentDpi);
+                else
+                {
+                    uint err = WinApi.GetLastError();
+                    Log($"[WARN] SetWindowPos failed for {procName} (Error: {err})");
+                }
+
+                return ok;
             }
         }
         else
         {
-            if (wp.showCmd == WinApi.SW_SHOWNORMAL)
+            // First time seeing this window: learn its size on this monitor's DPI
+            if (WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect))
             {
-                if (WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect))
+                int w = currentRect.Right - currentRect.Left;
+                int h = currentRect.Bottom - currentRect.Top;
+                if (w > 120 && h > 100)
                 {
-                    int w = currentRect.Right - currentRect.Left;
-                    int h = currentRect.Bottom - currentRect.Top;
-                    if (w > 120 && h > 100)
+                    _rules[procName] = new WindowDpiRule
                     {
-                        _rules[procName] = new WindowDpiRule
-                        {
-                            SavedWidth = w,
-                            SavedHeight = h,
-                            SavedDpi = currentDpi,
-                            LastUpdatedUtc = DateTime.UtcNow
-                        };
-                        Log($"Learned initial size for {procName}: {w}x{h} on DPI {currentDpi}");
-                        SaveRulesDebounced();
-                    }
+                        SavedWidth = w,
+                        SavedHeight = h,
+                        SavedDpi = currentDpi,
+                        LastUpdatedUtc = DateTime.UtcNow
+                    };
+                    Log($"Recorded initial size for {procName}: {w}x{h} on DPI {currentDpi}");
+                    SaveRulesDebounced();
                 }
             }
         }
 
         return false;
-    }
-
-    private static void EnsureMaximizedWindowHasCorrectRestoreDownRect(IntPtr hwnd, string procName, IntPtr monitor, uint currentDpi)
-    {
-        if (!_rules.TryGetValue(procName, out var rule)) return;
-
-        var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
-        if (!WinApi.GetWindowPlacement(hwnd, ref wp)) return;
-
-        double dpiRatio = (double)currentDpi / (rule.SavedDpi > 0 ? rule.SavedDpi : 96);
-        int targetW = (int)Math.Round(rule.SavedWidth * dpiRatio);
-        int targetH = (int)Math.Round(rule.SavedHeight * dpiRatio);
-
-        var monInfo = new WinApi.MONITORINFO { cbSize = Marshal.SizeOf<WinApi.MONITORINFO>() };
-        WinApi.GetMonitorInfo(monitor, ref monInfo);
-
-        int workW = monInfo.rcWork.Right - monInfo.rcWork.Left;
-        int workH = monInfo.rcWork.Bottom - monInfo.rcWork.Top;
-
-        targetW = Math.Min(targetW, workW - 20);
-        targetH = Math.Min(targetH, workH - 20);
-
-        int centerX = monInfo.rcWork.Left + (workW - targetW) / 2;
-        int centerY = monInfo.rcWork.Top + (workH - targetH) / 2;
-
-        wp.rcNormalPosition = new WinApi.RECT
-        {
-            Left = centerX,
-            Top = centerY,
-            Right = centerX + targetW,
-            Bottom = centerY + targetH
-        };
-
-        WinApi.SetWindowPlacement(hwnd, ref wp);
     }
 
     public static int NormalizeAllWindows()
@@ -437,7 +397,7 @@ internal static class Program
 
     public static void OnDisplayTopologyChanged()
     {
-        _lastNormalizedTicks.Clear();
+        _handledOnShow.Clear();
         Log("Display topology changed (monitor connect/disconnect).");
         Task.Run(async () =>
         {
@@ -502,7 +462,6 @@ internal static class Program
         WinApi.GetClassName(hwnd, sb, sb.Capacity);
         string cls = sb.ToString();
 
-        // Fast-path known system windows
         if (cls == "TaskManagerWindow") return "Taskmgr";
         if (cls == "CabinetWClass") return "explorer";
         if (cls == "Notepad") return "notepad";
@@ -533,7 +492,6 @@ internal static class Program
         WinApi.GetClassName(hwnd, sb, sb.Capacity);
         string cls = sb.ToString();
 
-        // Fast-allow Task Manager and common tools
         if (cls is "TaskManagerWindow" or "CabinetWClass" or "Notepad")
             return true;
 
@@ -573,12 +531,6 @@ internal static class Program
             }
         }
         catch { }
-
-        // Default: On 1080p (96 DPI), Task Manager comfortable width is 750px (fits all tabs and search)
-        // On 150% (144 DPI), it will automatically become 750 * 1.5 = 1125px (avoiding squished responsive mode)
-        _rules.TryAdd("Taskmgr", new WindowDpiRule { SavedWidth = 750, SavedHeight = 580, SavedDpi = 96 });
-        _rules.TryAdd("explorer", new WindowDpiRule { SavedWidth = 1000, SavedHeight = 700, SavedDpi = 96 });
-        _rules.TryAdd("notepad", new WindowDpiRule { SavedWidth = 850, SavedHeight = 600, SavedDpi = 96 });
     }
 
     private static int _saveDebouncePending = 0;
@@ -696,31 +648,18 @@ internal static class WinApi
     public const uint MOD_ALT = 0x0001;
     public const uint MOD_CONTROL = 0x0002;
 
-    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
     public const uint EVENT_SYSTEM_MOVESIZEEND = 0x000B;
     public const uint EVENT_OBJECT_SHOW = 0x8002;
     public const uint WINEVENT_OUTOFCONTEXT = 0;
     public const uint WINEVENT_SKIPOWNPROCESS = 2;
-
-    public const int WM_SIZE = 0x0005;
-    public const int SIZE_RESTORED = 0;
 
     public const int GWL_EXSTYLE = -20;
     public const int WS_EX_TOOLWINDOW = 0x00000080;
 
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
-    public const uint SWP_FRAMECHANGED = 0x0020;
-    public const uint SWP_NOCOPYBITS = 0x0100;
-
-    public const uint RDW_INVALIDATE = 0x0001;
-    public const uint RDW_ERASE = 0x0004;
-    public const uint RDW_ALLCHILDREN = 0x0080;
-    public const uint RDW_UPDATENOW = 0x0100;
-    public const uint RDW_FRAME = 0x0400;
 
     public const int SW_SHOWNORMAL = 1;
-    public const int SW_SHOWMAXIMIZED = 3;
 
     public const uint MONITOR_DEFAULTTONEAREST = 2;
     public const int MDT_EFFECTIVE_DPI = 0;
@@ -769,11 +708,8 @@ internal static class WinApi
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
-    [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
     [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
-    [DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
-    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
     [DllImport("kernel32.dll")] public static extern uint GetLastError();
 }
