@@ -1,0 +1,28 @@
+## Build results
+[Bb]in/
+[Oo]bj/
+publish/
+
+## User-specific files & local state
+*.user
+*.suo
+*.userprefs
+*.log
+activity.log
+window_dpi_rules.json
+
+## Visual Studio & IDEs
+.vs/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+
+## Operating System Files
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
