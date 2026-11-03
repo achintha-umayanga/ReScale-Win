@@ -11,6 +11,13 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <AssemblyName>ReScale</AssemblyName>
     <RootNamespace>ReScale</RootNamespace>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Product>ReScale</Product>
+    <Description>Universal Multi-Monitor DPI Normalizer for Windows 10 &amp; 11</Description>
+    <Authors>Achintha Umayanga</Authors>
+    <RepositoryUrl>https://github.com/achintha-umayanga/ReScale</RepositoryUrl>
   </PropertyGroup>
 
   <ItemGroup>

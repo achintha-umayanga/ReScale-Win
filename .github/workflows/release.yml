@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve Release Tag
+        id: vars
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag_name }}"
+          if (-not $tag) {
+            $tag = "${{ github.ref_name }}"
+          }
+          if (-not $tag) {
+            $tag = "v1.0.0"
+          }
+          Write-Host "Releasing tag: $tag"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish Self-Contained Standalone (win-x64)
+        run: |
+          dotnet publish ReScale.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o dist/standalone
+
+      - name: Publish Framework-Dependent Portable
+        run: |
+          dotnet publish ReScale.csproj -c Release -o dist/portable
+
+      - name: Package Release Archives
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.vars.outputs.tag }}"
+          
+          # Prepare standalone directory
+          Copy-Item "Run-ReScale.bat" "dist/standalone/" -Force
+          Copy-Item "app.ico" "dist/standalone/" -Force
+          Copy-Item "LICENSE" "dist/standalone/" -Force
+          Copy-Item "README.md" "dist/standalone/" -Force
+          
+          # Prepare portable directory
+          Copy-Item "Run-ReScale.bat" "dist/portable/" -Force
+          Copy-Item "app.ico" "dist/portable/" -Force
+          Copy-Item "LICENSE" "dist/portable/" -Force
+          Copy-Item "README.md" "dist/portable/" -Force
+
+          # Create release assets
+          New-Item -ItemType Directory -Path "dist/artifacts" -Force
+
+          # Standalone Zip
+          Compress-Archive -Path "dist/standalone/*" -DestinationPath "dist/artifacts/ReScale-$tag-win-x64-standalone.zip" -Force
+          
+          # Standalone Single Executable
+          Copy-Item "dist/standalone/ReScale.exe" "dist/artifacts/ReScale-$tag-win-x64.exe" -Force
+          
+          # Portable Zip
+          Compress-Archive -Path "dist/portable/*" -DestinationPath "dist/artifacts/ReScale-$tag-portable.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: ReScale ${{ steps.vars.outputs.tag }}
+          files: |
+            dist/artifacts/*.zip
+            dist/artifacts/*.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: false

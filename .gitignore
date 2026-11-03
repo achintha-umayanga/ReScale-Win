@@ -2,6 +2,8 @@
 [Bb]in/
 [Oo]bj/
 publish/
+dist/
+*.zip
 
 ## User-specific files & local state
 *.user
@@ -25,4 +27,3 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 .DS_Store
-

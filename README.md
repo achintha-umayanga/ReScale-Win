@@ -10,6 +10,7 @@
 
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-0078D6?style=flat-square&logo=windows)](https://microsoft.com)
 [![Framework](https://img.shields.io/badge/.NET-10.0-512BD4?style=flat-square&logo=dotnet)](https://dotnet.microsoft.com/)
+[![Release](https://img.shields.io/github/v/release/achintha-umayanga/ReScale-Win?style=flat-square&logo=github&color=blue)](https://github.com/achintha-umayanga/ReScale-Win/releases)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 </div>
@@ -84,9 +85,11 @@ $$\text{Target Height} = \text{Saved Height} \times \left(\frac{\text{Current DP
 
 ## 🚀 Quick Start
 
-### 1. Run Pre-Compiled Binary
-1. Clone or download this repository.
-2. Double-click **`Run-ReScale.bat`** (or execute `publish\ReScale.exe`).
+### 1. Download & Run Pre-Compiled Binary
+1. Download the latest release from the [**Releases Page**](https://github.com/achintha-umayanga/ReScale-Win/releases/latest).
+   * **`ReScale-v1.0.0-win-x64-standalone.zip`** *(Recommended)*: Zero dependencies, works standalone without installing .NET runtime.
+   * **`ReScale-v1.0.0-portable.zip`**: Lightweight package for systems with .NET 10 Desktop Runtime installed.
+2. Extract the archive and launch **`ReScale.exe`** (or double-click **`Run-ReScale.bat`**).
 3. Click **Yes** on the Windows UAC prompt (required to manage elevated windows like Task Manager).
 4. The tool will sit silently in your **Windows System Tray** (near the clock).
 
