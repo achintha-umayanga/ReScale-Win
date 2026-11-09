@@ -79,6 +79,7 @@ internal static class Program
         Application.Run();
 
         // Cleanup
+        _saveTimer.Dispose();
         SaveRules();
         if (_hookMoveSize != IntPtr.Zero) WinApi.UnhookWinEvent(_hookMoveSize);
         if (_hookShow != IntPtr.Zero) WinApi.UnhookWinEvent(_hookShow);
@@ -603,31 +604,36 @@ internal static class Program
         catch { }
     }
 
-    private static int _saveDebouncePending = 0;
+    // Optimization 6: Cached JsonSerializerOptions + non-blocking OS timer debounce + atomic config save
+    private static readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
+    private static readonly System.Threading.Timer _saveTimer = new(_ => SaveRules(), null, Timeout.Infinite, Timeout.Infinite);
+    private static readonly object _saveLock = new();
+
     private static void SaveRulesDebounced()
     {
-        if (Interlocked.Exchange(ref _saveDebouncePending, 1) == 0)
+        try
         {
-            ThreadPool.QueueUserWorkItem(_ =>
-            {
-                Thread.Sleep(2000);
-                Interlocked.Exchange(ref _saveDebouncePending, 0);
-                SaveRules();
-            });
+            _saveTimer.Change(2000, Timeout.Infinite);
         }
+        catch { }
     }
 
     private static void SaveRules()
     {
-        try
+        lock (_saveLock)
         {
-            string dir = Path.GetDirectoryName(ConfigPath)!;
-            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            try
+            {
+                string dir = Path.GetDirectoryName(ConfigPath)!;
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
 
-            string json = JsonSerializer.Serialize(_rules, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(ConfigPath, json);
+                string json = JsonSerializer.Serialize(_rules, _jsonOptions);
+                string tmpPath = ConfigPath + ".tmp";
+                File.WriteAllText(tmpPath, json);
+                File.Move(tmpPath, ConfigPath, overwrite: true);
+            }
+            catch { }
         }
-        catch { }
     }
 
     private static bool IsAutoStartEnabled()
