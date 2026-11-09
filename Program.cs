@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -18,6 +19,7 @@ namespace ReScale;
 internal static class Program
 {
     private static NotifyIcon? _trayIcon;
+    private static Icon? _trayIconImage;
     private static ContextMenuStrip? _trayMenu;
     private static IntPtr _hookMoveSize = IntPtr.Zero;
     private static IntPtr _hookShow = IntPtr.Zero;
@@ -31,11 +33,34 @@ internal static class Program
     private static readonly string ConfigPath = Path.Combine(AppDir, "window_dpi_rules.json");
     private static readonly string LogPath = Path.Combine(AppDir, "activity.log");
 
-    // Tracks windows already handled on launch to prevent double-resizing: hwnd -> true
-    private static readonly ConcurrentDictionary<IntPtr, bool> _handledOnShow = new();
+    // Tracks windows recently handled on show: hwnd -> Environment.TickCount64 of last handling.
+    // A cooldown (not a permanent set) means recycled HWNDs are handled again once the cooldown expires,
+    // and stale entries can be pruned by age without calling IsWindow on each one.
+    private static readonly ConcurrentDictionary<IntPtr, long> _handledOnShow = new();
+    private const long ShowCooldownMs = 3000; // covers the full launch-retry window below
+    private static int _pruneThreshold = 64;
+
+    // Launch retry schedule: cloaked (UWP splash / other virtual desktop) or still-tiny windows get re-checked.
+    private static readonly int[] LaunchRetryDelaysMs = { 200, 400, 800 };
+
+    // PID -> resolved process name (null = could not be opened), with a TTL to tolerate PID reuse.
+    private readonly record struct PidEntry(string? Name, long Tick);
+    private static readonly ConcurrentDictionary<uint, PidEntry> _pidCache = new();
+    private const long PidCacheTtlMs = 30_000;
+    private static readonly uint _ownPid = (uint)Environment.ProcessId;
+
+    // Shell / system hosts that must never be resized or learned.
+    private static readonly FrozenSet<string> ExcludedProcesses = new[]
+    {
+        "ShellExperienceHost", "StartMenuExperienceHost", "SearchHost", "SearchApp", "SearchUI",
+        "TextInputHost", "LockApp", "LogonUI", "dwm", "ScreenClippingHost", "ShellHost",
+        "PeopleExperienceHost", "Widgets", "WidgetService"
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
     private const int HOTKEY_ID_ACTIVE = 9001;
     private const int HOTKEY_ID_ALL = 9002;
+
+    private enum Candidate { Reject, NotReady, Ok }
 
     [STAThread]
     private static void Main()
@@ -54,8 +79,10 @@ internal static class Program
         _msgWindow = new MessageOnlyWindow();
 
         // Hotkeys: Ctrl+Alt+S (Active window), Ctrl+Alt+A (All windows)
-        WinApi.RegisterHotKey(_msgWindow.Handle, HOTKEY_ID_ACTIVE, WinApi.MOD_CONTROL | WinApi.MOD_ALT, (uint)Keys.S);
-        WinApi.RegisterHotKey(_msgWindow.Handle, HOTKEY_ID_ALL, WinApi.MOD_CONTROL | WinApi.MOD_ALT, (uint)Keys.A);
+        if (!WinApi.RegisterHotKey(_msgWindow.Handle, HOTKEY_ID_ACTIVE, WinApi.MOD_CONTROL | WinApi.MOD_ALT, (uint)Keys.S))
+            Log($"[WARN] Could not register Ctrl+Alt+S (error {Marshal.GetLastWin32Error()}). It is probably used by another app.");
+        if (!WinApi.RegisterHotKey(_msgWindow.Handle, HOTKEY_ID_ALL, WinApi.MOD_CONTROL | WinApi.MOD_ALT, (uint)Keys.A))
+            Log($"[WARN] Could not register Ctrl+Alt+A (error {Marshal.GetLastWin32Error()}). It is probably used by another app.");
 
         _moveSizeDelegate = OnMoveSizeEnd;
         _showDelegate = OnWindowShow;
@@ -65,20 +92,19 @@ internal static class Program
             WinApi.EVENT_SYSTEM_MOVESIZEEND, WinApi.EVENT_SYSTEM_MOVESIZEEND,
             IntPtr.Zero, _moveSizeDelegate, 0, 0,
             WinApi.WINEVENT_OUTOFCONTEXT | WinApi.WINEVENT_SKIPOWNPROCESS);
+        if (_hookMoveSize == IntPtr.Zero) Log("[ERROR] SetWinEventHook(MOVESIZEEND) failed. Manual resizes will not be learned.");
 
         // Hook when a window is shown / created: EVENT_OBJECT_SHOW = 0x8002
         _hookShow = WinApi.SetWinEventHook(
             WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW,
             IntPtr.Zero, _showDelegate, 0, 0,
             WinApi.WINEVENT_OUTOFCONTEXT | WinApi.WINEVENT_SKIPOWNPROCESS);
+        if (_hookShow == IntPtr.Zero) Log("[ERROR] SetWinEventHook(OBJECT_SHOW) failed. New windows will not be normalized.");
 
         SetupTrayIcon();
 
         // Learn sizes of existing open windows without altering them
         InitialScanOpenWindows();
-
-        // Optimization 7: Trim startup working set pages before entering idle tray message loop
-        try { WinApi.SetProcessWorkingSetSize(WinApi.GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1)); } catch { }
 
         Application.Run();
 
@@ -94,6 +120,9 @@ internal static class Program
             _msgWindow.Dispose();
         }
         _trayIcon?.Dispose();
+        _trayIconImage?.Dispose();
+        GC.KeepAlive(_moveSizeDelegate);
+        GC.KeepAlive(_showDelegate);
     }
 
     private static readonly bool _isAdmin = CheckIsRunningAsAdmin();
@@ -113,7 +142,6 @@ internal static class Program
     private static readonly object _logLock = new();
     private const long MaxLogBytes = 256 * 1024; // 256 KB max log size
     private static long _logSize = -1; // tracked in memory; -1 = not yet read from disk
-    private static int _pruneThreshold = 64;
 
     private static void Log(string msg)
     {
@@ -142,6 +170,28 @@ internal static class Program
             }
             catch { _logSize = -1; }
         }
+    }
+
+    private static Icon LoadTrayIcon()
+    {
+        // 1) app.ico next to the exe (copied by the build), loaded at the tray's small-icon size for crisp rendering
+        try
+        {
+            string icoPath = Path.Combine(AppDir, "app.ico");
+            if (File.Exists(icoPath)) return new Icon(icoPath, SystemInformation.SmallIconSize);
+        }
+        catch { }
+
+        // 2) Icon embedded in the exe via <ApplicationIcon>
+        try
+        {
+            var embedded = Icon.ExtractAssociatedIcon(Environment.ProcessPath ?? Application.ExecutablePath);
+            if (embedded != null) return embedded;
+        }
+        catch { }
+
+        // 3) Last resort
+        return (Icon)SystemIcons.Application.Clone();
     }
 
     private static void SetupTrayIcon()
@@ -220,9 +270,10 @@ internal static class Program
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit", null, (s, e) => Application.Exit());
 
+        _trayIconImage = LoadTrayIcon();
         _trayIcon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = _trayIconImage,
             ContextMenuStrip = _trayMenu,
             Text = $"ReScale {adminStatus}",
             Visible = true
@@ -235,94 +286,167 @@ internal static class Program
         };
     }
 
+    // ───────────────────────────── Rule math ─────────────────────────────
+
+    /// <summary>The user's anchored size, scaled to <paramref name="dpi"/>. Always computed from the anchor, so no drift accumulates.</summary>
+    private static (int W, int H) ScaleRule(WindowDpiRule rule, uint dpi)
+    {
+        double baseDpi = rule.SavedDpi > 0 ? rule.SavedDpi : 96;
+        return ((int)Math.Round(rule.SavedWidth * (dpi / baseDpi)),
+                (int)Math.Round(rule.SavedHeight * (dpi / baseDpi)));
+    }
+
+    private static bool Within(int actual, int expected, double tolerance) =>
+        expected > 0 && Math.Abs(actual - expected) / (double)expected <= tolerance;
+
+    private static bool GetWorkArea(IntPtr monitor, out WinApi.RECT work)
+    {
+        var monInfo = new WinApi.MONITORINFO { cbSize = Marshal.SizeOf<WinApi.MONITORINFO>() };
+        bool ok = WinApi.GetMonitorInfoW(monitor, ref monInfo);
+        work = monInfo.rcWork;
+        return ok && work.Right > work.Left && work.Bottom > work.Top;
+    }
+
     /// <summary>
     /// Event: User manually moved or resized a window.
     /// Record the window's physical dimensions along with the exact DPI of the monitor it sits on.
     /// </summary>
     private static void OnMoveSizeEnd(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
-        if (idObject != 0 || hwnd == IntPtr.Zero || !IsCandidateAppWindow(hwnd, out string cls)) return;
+        if (idObject != 0 || hwnd == IntPtr.Zero) return;
+        if (Classify(hwnd, out string? specialProc) != Candidate.Ok) return;
 
         var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
         if (!WinApi.GetWindowPlacement(hwnd, ref wp) || wp.showCmd != WinApi.SW_SHOWNORMAL) return;
 
-        string? procName = GetProcessName(hwnd, cls);
-        if (string.IsNullOrEmpty(procName)) return;
+        string? procName = specialProc ?? ResolveProcessName(hwnd);
+        if (procName == null || ExcludedProcesses.Contains(procName)) return;
+
+        if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT rc)) return;
+        int w = rc.Right - rc.Left;
+        int h = rc.Bottom - rc.Top;
+        if (w <= 120 || h <= 100) return;
 
         IntPtr monitor = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
         uint dpi = GetMonitorDpi(monitor);
 
-        if (WinApi.GetWindowRect(hwnd, out WinApi.RECT rc))
+        if (_rules.TryGetValue(procName, out var existing))
         {
-            int w = rc.Right - rc.Left;
-            int h = rc.Bottom - rc.Top;
-
-            if (w > 120 && h > 100)
+            // Plain drag on the anchor's own DPI with an unchanged size: nothing to do (no log, no disk write).
+            if (dpi == existing.SavedDpi && existing.SavedWidth == w && existing.SavedHeight == h)
             {
-                // Optimization 1: Skip redundant rule updates, logging, and disk writes if size & DPI haven't changed (window was just moved)
-                if (_rules.TryGetValue(procName, out var existingRule) &&
-                    existingRule.SavedWidth == w &&
-                    existingRule.SavedHeight == h &&
-                    existingRule.SavedDpi == dpi)
+                if (existing.LastAppliedDpi != 0 && existing.LastAppliedDpi != dpi)
                 {
-                    return;
+                    _rules[procName] = existing with { LastAppliedDpi = dpi };
+                    SaveRulesDebounced();
+                }
+                return;
+            }
+
+            // Plain drag on a different DPI where the size is just the anchor scaled to this DPI (by us or by
+            // Windows' own WM_DPICHANGED handling), or that size clamped to the work area. That is a move,
+            // not a user resize, so the anchor stays as the user's real size. Only record which DPI it now sits on.
+            if (dpi != existing.SavedDpi)
+            {
+                var (ew, eh) = ScaleRule(existing, dpi);
+                bool matchesScaled = Within(w, ew, 0.02) && Within(h, eh, 0.02);
+                bool matchesClamped = false;
+                if (GetWorkArea(monitor, out var work))
+                {
+                    int cw = Math.Min(ew, (work.Right - work.Left) - 20);
+                    int ch = Math.Min(eh, (work.Bottom - work.Top) - 20);
+                    matchesClamped = Within(w, cw, 0.02) && Within(h, ch, 0.02);
                 }
 
-                _rules[procName] = new WindowDpiRule
+                if (matchesScaled || matchesClamped)
                 {
-                    SavedWidth = w,
-                    SavedHeight = h,
-                    SavedDpi = dpi,
-                    LastUpdatedUtc = DateTime.UtcNow
-                };
-                Log($"Learned size for {procName}: {w}x{h} on DPI {dpi}");
-                SaveRulesDebounced();
+                    if (existing.LastAppliedDpi != dpi)
+                    {
+                        _rules[procName] = existing with { LastAppliedDpi = dpi };
+                        SaveRulesDebounced();
+                    }
+                    return;
+                }
             }
         }
+
+        // A genuine user resize: re-anchor to the user's real size on this DPI.
+        _rules[procName] = new WindowDpiRule
+        {
+            SavedWidth = w,
+            SavedHeight = h,
+            SavedDpi = dpi,
+            LastAppliedDpi = 0,
+            LastUpdatedUtc = DateTime.UtcNow
+        };
+        Log($"Learned size for {procName}: {w}x{h} on DPI {dpi}");
+        SaveRulesDebounced();
     }
 
     /// <summary>
-    /// Event: A window is opened / created.
-    /// Only triggers on initial window launch.
+    /// Event: A window is opened / shown.
     /// </summary>
     private static void OnWindowShow(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
-        // Optimization 3: Fast integer & memory lookup BEFORE making Win32 P/Invoke calls or allocations
         if (idObject != 0 || idChild != 0 || hwnd == IntPtr.Zero) return;
-        if (_handledOnShow.ContainsKey(hwnd)) return;
-        if (!IsCandidateAppWindow(hwnd)) return;
 
-        // Prune closed handles only when the set has doubled since the last prune,
-        // so many open windows don't trigger an O(n) sweep on every new window.
+        long now = Environment.TickCount64;
+        if (_handledOnShow.TryGetValue(hwnd, out long last) && now - last < ShowCooldownMs) return;
+
+        // Cheap structural filter first (style bits reject child windows before anything else).
+        // NotReady (cloaked / still tiny) still gets scheduled so the retry loop can pick it up.
+        if (Classify(hwnd, out _) == Candidate.Reject) return;
+
+        _handledOnShow[hwnd] = now;
+
+        // Prune by age (no IsWindow calls). Only when the map has doubled since the last prune,
+        // and every entry expires after the cooldown, so the map cannot grow without bound.
         if (_handledOnShow.Count >= _pruneThreshold)
         {
-            foreach (var key in _handledOnShow.Keys)
+            foreach (var kvp in _handledOnShow)
             {
-                if (!WinApi.IsWindow(key)) _handledOnShow.TryRemove(key, out _);
+                if (now - kvp.Value >= ShowCooldownMs) _handledOnShow.TryRemove(kvp.Key, out _);
             }
             _pruneThreshold = Math.Max(64, _handledOnShow.Count * 2);
         }
 
-        if (_handledOnShow.TryAdd(hwnd, true))
+        _ = NormalizeAfterLaunchAsync(hwnd);
+    }
+
+    private static async Task NormalizeAfterLaunchAsync(IntPtr hwnd)
+    {
+        try
         {
-            Task.Run(async () =>
+            foreach (int delay in LaunchRetryDelaysMs)
             {
-                // Give window a moment to finish initial launch painting
-                await Task.Delay(200);
-                if (!WinApi.IsWindow(hwnd)) return;
-                NormalizeWindowDpi(hwnd, force: false);
-            });
+                // Give the window a moment to finish its launch (and UWP splash / DWM uncloak)
+                await Task.Delay(delay).ConfigureAwait(false);
+
+                switch (Classify(hwnd, out _))
+                {
+                    case Candidate.Reject: return;
+                    case Candidate.NotReady: continue;
+                    default:
+                        NormalizeWindowDpi(hwnd, force: false);
+                        return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"[ERROR] Launch normalization failed: {ex.Message}");
         }
     }
 
     /// <summary>
     /// Checks if a window opened on a monitor with a DIFFERENT DPI than where it was saved.
     /// ONLY resizes if there is an actual DPI mismatch (e.g. saved on 96 DPI, opened on 144 DPI).
-    /// If it is on the same DPI, it leaves the window completely untouched!
+    /// If it is on the same DPI, it leaves the window completely untouched, unless it came back
+    /// at the size ReScale gave it on another monitor (then it is restored to the user's real size).
     /// </summary>
     public static bool NormalizeWindowDpi(IntPtr hwnd, bool force)
     {
-        if (!IsCandidateAppWindow(hwnd, out string cls)) return false;
+        if (Classify(hwnd, out string? specialProc) != Candidate.Ok) return false;
 
         var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
         if (!WinApi.GetWindowPlacement(hwnd, ref wp)) return false;
@@ -330,105 +454,98 @@ internal static class Program
         // Only handle normal (restored down) windows
         if (wp.showCmd != WinApi.SW_SHOWNORMAL) return false;
 
-        string? procName = GetProcessName(hwnd, cls);
-        if (string.IsNullOrEmpty(procName)) return false;
+        string? procName = specialProc ?? ResolveProcessName(hwnd);
+        if (procName == null || ExcludedProcesses.Contains(procName)) return false;
 
         IntPtr monitor = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
         uint currentDpi = GetMonitorDpi(monitor);
+        if (!GetWorkArea(monitor, out var work)) return false;
+        int workW = work.Right - work.Left;
+        int workH = work.Bottom - work.Top;
 
-        var monInfo = new WinApi.MONITORINFO { cbSize = Marshal.SizeOf<WinApi.MONITORINFO>() };
-        WinApi.GetMonitorInfo(monitor, ref monInfo);
-        int workW = monInfo.rcWork.Right - monInfo.rcWork.Left;
-        int workH = monInfo.rcWork.Bottom - monInfo.rcWork.Top;
-
-        if (workW <= 0 || workH <= 0) return false;
+        if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect)) return false;
+        int curW = currentRect.Right - currentRect.Left;
+        int curH = currentRect.Bottom - currentRect.Top;
 
         if (_rules.TryGetValue(procName, out var rule))
         {
-            // CRITICAL CHECK:
-            // If the window is on the SAME DPI monitor where it was saved, DO NOT TOUCH IT!
-            // Let the window and Windows manage its natural size and internal layout.
             if (!force && currentDpi == rule.SavedDpi)
             {
+                // CRITICAL CHECK:
+                // On the SAME DPI where the size was saved, DO NOT TOUCH the window...
+                if (rule.LastAppliedDpi == 0 || rule.LastAppliedDpi == rule.SavedDpi) return false;
+
+                // ...unless it came back at the size we scaled it to on another DPI (stale scaled size).
+                // One matching dimension is enough because the other may have been clamped to a smaller work area.
+                var (pw, ph) = ScaleRule(rule, rule.LastAppliedDpi);
+                if (!Within(curW, pw, 0.08) && !Within(curH, ph, 0.08)) return false;
+            }
+
+            // Target is always derived from the user's anchored size, so 96 -> 144 -> 96 returns to the exact original.
+            var (targetW, targetH) = ScaleRule(rule, currentDpi);
+
+            // Clamp only the on-screen placement. The anchor in the rule is never overwritten with clamped values.
+            targetW = Math.Min(targetW, workW - 20);
+            targetH = Math.Min(targetH, workH - 20);
+            if (targetW <= 0 || targetH <= 0) return false;
+
+            // Only adjust if the window size differs meaningfully from target scaled size
+            if (!force && Within(curW, targetW, 0.08) && Within(curH, targetH, 0.08))
+            {
+                // Already correct for this DPI; remember where it is so a later return is recognized.
+                if (rule.LastAppliedDpi != currentDpi && currentDpi != rule.SavedDpi)
+                {
+                    _rules[procName] = rule with { LastAppliedDpi = currentDpi };
+                    SaveRulesDebounced();
+                }
                 return false;
             }
 
-            // An actual DPI change occurred (e.g. saved on 96 DPI, opened on 144 DPI)!
-            double dpiRatio = (double)currentDpi / (rule.SavedDpi > 0 ? rule.SavedDpi : 96);
+            int x = currentRect.Left;
+            int y = currentRect.Top;
+            if (x + targetW > work.Right) x = work.Right - targetW;
+            if (y + targetH > work.Bottom) y = work.Bottom - targetH;
+            if (x < work.Left) x = work.Left;
+            if (y < work.Top) y = work.Top;
 
-            int targetW = (int)Math.Round(rule.SavedWidth * dpiRatio);
-            int targetH = (int)Math.Round(rule.SavedHeight * dpiRatio);
+            // Adjust ONLY the outer window size cleanly.
+            // Do not post fake messages. Let Windows automatically adjust internal structures.
+            // SWP_ASYNCWINDOWPOS: never block on a hung target app.
+            bool ok = WinApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, targetW, targetH,
+                WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE | WinApi.SWP_ASYNCWINDOWPOS);
 
-            targetW = Math.Min(targetW, workW - 20);
-            targetH = Math.Min(targetH, workH - 20);
-
-            if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect)) return false;
-            int curW = currentRect.Right - currentRect.Left;
-            int curH = currentRect.Bottom - currentRect.Top;
-
-            double diffW = Math.Abs(curW - targetW) / (double)targetW;
-            double diffH = Math.Abs(curH - targetH) / (double)targetH;
-
-            // Only adjust if the window size differs meaningfully from target scaled size
-            if (force || diffW > 0.08 || diffH > 0.08)
+            if (ok)
             {
-                int x = currentRect.Left;
-                int y = currentRect.Top;
+                // Anchor (SavedWidth/Height/Dpi) stays untouched; only record which DPI we applied.
+                // Replace the rule object atomically (never mutate in place) so a concurrent save never sees a half-updated rule.
+                _rules[procName] = rule with { LastAppliedDpi = currentDpi };
+                SaveRulesDebounced();
 
-                if (x + targetW > monInfo.rcWork.Right) x = monInfo.rcWork.Right - targetW;
-                if (y + targetH > monInfo.rcWork.Bottom) y = monInfo.rcWork.Bottom - targetH;
-                if (x < monInfo.rcWork.Left) x = monInfo.rcWork.Left;
-                if (y < monInfo.rcWork.Top) y = monInfo.rcWork.Top;
-
-                // Adjust ONLY the outer window size cleanly.
-                // Do not post fake messages. Let Windows automatically adjust internal structures.
-                bool ok = WinApi.SetWindowPos(hwnd, IntPtr.Zero, x, y, targetW, targetH,
-                    WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
-
-                if (ok)
-                {
-                    // Calibrate rule to the new monitor DPI so it stays untouched while on this monitor.
-                    // Replace the rule object atomically (never mutate in place) so a concurrent save never sees a half-updated rule.
-                    _rules[procName] = new WindowDpiRule
-                    {
-                        SavedWidth = targetW,
-                        SavedHeight = targetH,
-                        SavedDpi = currentDpi,
-                        LastUpdatedUtc = DateTime.UtcNow
-                    };
-                    SaveRulesDebounced();
-
-                    Log($"[SUCCESS] Scaled {procName} for DPI change: {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {dpiRatio:F2})");
-                }
-                else
-                {
-                    uint err = WinApi.GetLastError();
-                    Log($"[WARN] SetWindowPos failed for {procName} (Error: {err})");
-                }
-
-                return ok;
+                double ratio = currentDpi / (double)(rule.SavedDpi > 0 ? rule.SavedDpi : 96);
+                Log($"[SUCCESS] Scaled {procName} for DPI change: {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {ratio:F2})");
             }
+            else
+            {
+                int err = Marshal.GetLastWin32Error();
+                Log($"[WARN] SetWindowPos failed for {procName} (Error: {err})");
+            }
+
+            return ok;
         }
-        else
+
+        // First time seeing this window: learn its size on this monitor's DPI
+        if (curW > 120 && curH > 100)
         {
-            // First time seeing this window: learn its size on this monitor's DPI
-            if (WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect))
+            _rules[procName] = new WindowDpiRule
             {
-                int w = currentRect.Right - currentRect.Left;
-                int h = currentRect.Bottom - currentRect.Top;
-                if (w > 120 && h > 100)
-                {
-                    _rules[procName] = new WindowDpiRule
-                    {
-                        SavedWidth = w,
-                        SavedHeight = h,
-                        SavedDpi = currentDpi,
-                        LastUpdatedUtc = DateTime.UtcNow
-                    };
-                    Log($"Recorded initial size for {procName}: {w}x{h} on DPI {currentDpi}");
-                    SaveRulesDebounced();
-                }
-            }
+                SavedWidth = curW,
+                SavedHeight = curH,
+                SavedDpi = currentDpi,
+                LastAppliedDpi = 0,
+                LastUpdatedUtc = DateTime.UtcNow
+            };
+            Log($"Recorded initial size for {procName}: {curW}x{curH} on DPI {currentDpi}");
+            SaveRulesDebounced();
         }
 
         return false;
@@ -452,7 +569,7 @@ internal static class Program
     private static int _topologyChangeVersion = 0;
     public static void OnDisplayTopologyChanged()
     {
-        // Optimization 2: Coalesce rapid-fire WM_DISPLAYCHANGE events when plugging/unplugging monitors
+        // Coalesce rapid-fire WM_DISPLAYCHANGE events when plugging/unplugging monitors
         int version = Interlocked.Increment(ref _topologyChangeVersion);
         _handledOnShow.Clear();
 
@@ -475,34 +592,32 @@ internal static class Program
     {
         WinApi.EnumWindows((hwnd, lParam) =>
         {
-            if (IsCandidateAppWindow(hwnd, out string cls))
-            {
-                var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
-                if (WinApi.GetWindowPlacement(hwnd, ref wp) && wp.showCmd == WinApi.SW_SHOWNORMAL)
-                {
-                    string? procName = GetProcessName(hwnd, cls);
-                    if (!string.IsNullOrEmpty(procName) && !_rules.ContainsKey(procName))
-                    {
-                        if (WinApi.GetWindowRect(hwnd, out WinApi.RECT rc))
-                        {
-                            int w = rc.Right - rc.Left;
-                            int h = rc.Bottom - rc.Top;
-                            if (w > 120 && h > 100)
-                            {
-                                IntPtr mon = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
-                                uint dpi = GetMonitorDpi(mon);
+            if (Classify(hwnd, out string? specialProc) != Candidate.Ok) return true;
 
-                                _rules[procName] = new WindowDpiRule
-                                {
-                                    SavedWidth = w,
-                                    SavedHeight = h,
-                                    SavedDpi = dpi,
-                                    LastUpdatedUtc = DateTime.UtcNow
-                                };
-                                Log($"Initial scan recorded {procName}: {w}x{h} (DPI {dpi})");
-                            }
-                        }
-                    }
+            var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
+            if (!WinApi.GetWindowPlacement(hwnd, ref wp) || wp.showCmd != WinApi.SW_SHOWNORMAL) return true;
+
+            string? procName = specialProc ?? ResolveProcessName(hwnd);
+            if (procName == null || ExcludedProcesses.Contains(procName) || _rules.ContainsKey(procName)) return true;
+
+            if (WinApi.GetWindowRect(hwnd, out WinApi.RECT rc))
+            {
+                int w = rc.Right - rc.Left;
+                int h = rc.Bottom - rc.Top;
+                if (w > 120 && h > 100)
+                {
+                    IntPtr mon = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
+                    uint dpi = GetMonitorDpi(mon);
+
+                    _rules[procName] = new WindowDpiRule
+                    {
+                        SavedWidth = w,
+                        SavedHeight = h,
+                        SavedDpi = dpi,
+                        LastAppliedDpi = 0,
+                        LastUpdatedUtc = DateTime.UtcNow
+                    };
+                    Log($"Initial scan recorded {procName}: {w}x{h} (DPI {dpi})");
                 }
             }
             return true;
@@ -519,109 +634,116 @@ internal static class Program
         return 96;
     }
 
-    [ThreadStatic]
-    private static StringBuilder? _sharedSb;
+    // ───────────────────────────── Window filter ─────────────────────────────
 
-    private static StringBuilder GetSharedStringBuilder(int minCapacity = 260)
+    /// <summary>
+    /// Single-pass window filter, cheapest checks first. Allocation-free (class name is read into a stack buffer).
+    /// Ok       = top-level, resizable, unowned app window that is visible and uncloaked.
+    /// NotReady = structurally valid but cloaked or still tiny (launching); worth retrying shortly.
+    /// Reject   = never a candidate.
+    /// <paramref name="specialProc"/> is set for well-known shell classes whose process name is fixed.
+    /// </summary>
+    private static unsafe Candidate Classify(IntPtr hwnd, out string? specialProc)
     {
-        var sb = _sharedSb;
-        if (sb == null)
+        specialProc = null;
+
+        // One call covers child / visible / minimized / resizable. Invalid HWNDs return 0, so they fail WS_VISIBLE.
+        int style = WinApi.GetWindowLongW(hwnd, WinApi.GWL_STYLE);
+        if ((style & WinApi.WS_CHILD) != 0) return Candidate.Reject;
+        if ((style & WinApi.WS_VISIBLE) == 0) return Candidate.Reject;
+        if ((style & WinApi.WS_MINIMIZE) != 0) return Candidate.Reject;
+        if ((style & WinApi.WS_THICKFRAME) == 0) return Candidate.Reject; // fixed-size dialogs, splash screens, popups
+
+        int exStyle = WinApi.GetWindowLongW(hwnd, WinApi.GWL_EXSTYLE);
+        if ((exStyle & (WinApi.WS_EX_TOOLWINDOW | WinApi.WS_EX_NOACTIVATE)) != 0) return Candidate.Reject;
+
+        if (WinApi.GetAncestor(hwnd, WinApi.GA_ROOT) != hwnd) return Candidate.Reject;
+
+        // Owned windows are dialogs / secondary popups unless they explicitly ask to be app windows.
+        if (WinApi.GetWindow(hwnd, WinApi.GW_OWNER) != IntPtr.Zero && (exStyle & WinApi.WS_EX_APPWINDOW) == 0)
+            return Candidate.Reject;
+
+        char* buf = stackalloc char[256];
+        int len = WinApi.GetClassNameW(hwnd, buf, 256);
+        if (len <= 0) return Candidate.Reject;
+        var cls = new ReadOnlySpan<char>(buf, len);
+
+        if (cls is "TaskManagerWindow") specialProc = "Taskmgr";
+        else if (cls is "CabinetWClass") specialProc = "explorer";
+        else if (cls is "Notepad") specialProc = "notepad";
+        else if (cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or
+                 "Windows.UI.Core.CoreWindow" or "DV2ControlHost" or "MsgrIMEWindowClass" or "SysShadow" or
+                 "TaskListThumbnailWnd" or "SideBar_HTMLHostWindow" or "XamlExplorerHostIslandWindow" or
+                 "PopupHost" or "Droplist" or "tooltips_class32" or "#32768")
         {
-            sb = new StringBuilder(minCapacity);
-            _sharedSb = sb;
+            return Candidate.Reject;
         }
-        else
-        {
-            sb.Clear();
-            if (sb.Capacity < minCapacity) sb.EnsureCapacity(minCapacity);
-        }
-        return sb;
+
+        // Cloaked: suspended UWP/WinUI apps, windows on other virtual desktops, apps still showing a splash.
+        if (WinApi.DwmGetWindowAttribute(hwnd, WinApi.DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0)
+            return Candidate.NotReady;
+
+        if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT rc)) return Candidate.Reject;
+        if (rc.Right - rc.Left < 120 || rc.Bottom - rc.Top < 100) return Candidate.NotReady;
+
+        return Candidate.Ok;
     }
 
-    private static string? GetProcessName(IntPtr hwnd, string? className = null)
+    // ───────────────────────────── Process name ─────────────────────────────
+
+    /// <summary>
+    /// Resolves the owning process name via OpenProcess + QueryFullProcessImageNameW, cached per PID with a TTL.
+    /// Failures are cached too (null), so protected processes are not re-queried on every event.
+    /// There is deliberately no Process.GetProcessById fallback: if PROCESS_QUERY_LIMITED_INFORMATION is denied,
+    /// the process is protected and its windows could not be resized anyway.
+    /// </summary>
+    private static string? ResolveProcessName(IntPtr hwnd)
     {
-        string cls = className ?? string.Empty;
-        if (string.IsNullOrEmpty(cls))
-        {
-            var sb = GetSharedStringBuilder(128);
-            WinApi.GetClassName(hwnd, sb, sb.Capacity);
-            cls = sb.ToString();
-        }
-
-        if (cls == "TaskManagerWindow") return "Taskmgr";
-        if (cls == "CabinetWClass") return "explorer";
-        if (cls == "Notepad") return "notepad";
-
         WinApi.GetWindowThreadProcessId(hwnd, out uint pid);
-        if (pid == 0) return null;
+        if (pid == 0 || pid == _ownPid) return null;
 
-        // Optimization 5: Fast native QueryFullProcessImageName lookup (avoids heavy Process.GetProcessById allocations & exceptions)
-        IntPtr hProc = WinApi.OpenProcess(WinApi.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        if (hProc != IntPtr.Zero)
+        long now = Environment.TickCount64;
+        if (_pidCache.TryGetValue(pid, out var entry) && now - entry.Tick < PidCacheTtlMs)
+            return entry.Name;
+
+        string? name = QueryProcessName(pid);
+
+        if (_pidCache.Count > 256)
         {
-            try
+            foreach (var kvp in _pidCache)
             {
-                var sb = GetSharedStringBuilder(260);
-                int capacity = sb.Capacity;
-                if (WinApi.QueryFullProcessImageName(hProc, 0, sb, ref capacity) && capacity > 0)
-                {
-                    return Path.GetFileNameWithoutExtension(sb.ToString());
-                }
-            }
-            finally
-            {
-                WinApi.CloseHandle(hProc);
+                if (now - kvp.Value.Tick >= PidCacheTtlMs) _pidCache.TryRemove(kvp.Key, out _);
             }
         }
+        _pidCache[pid] = new PidEntry(name, now);
+        return name;
+    }
 
+    private static unsafe string? QueryProcessName(uint pid)
+    {
+        IntPtr hProc = WinApi.OpenProcess(WinApi.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (hProc == IntPtr.Zero) return null;
         try
         {
-            using var proc = Process.GetProcessById((int)pid);
-            return proc.ProcessName;
+            const int Cap = 1024;
+            char* buf = stackalloc char[Cap];
+            int size = Cap;
+            if (!WinApi.QueryFullProcessImageNameW(hProc, 0, buf, ref size) || size <= 0) return null;
+
+            var path = new ReadOnlySpan<char>(buf, size);
+            int slash = path.LastIndexOf('\\');
+            if (slash >= 0) path = path[(slash + 1)..];
+            int dot = path.LastIndexOf('.');
+            if (dot > 0) path = path[..dot];
+            return path.Length > 0 ? new string(path) : null;
         }
-        catch
+        finally
         {
-            return null;
+            WinApi.CloseHandle(hProc);
         }
     }
 
-    private static bool IsCandidateAppWindow(IntPtr hwnd) => IsCandidateAppWindow(hwnd, out _);
-
-    private static bool IsCandidateAppWindow(IntPtr hwnd, out string className)
-    {
-        className = string.Empty;
-        if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowVisible(hwnd) || WinApi.IsIconic(hwnd))
-            return false;
-
-        int exStyle = WinApi.GetWindowLong(hwnd, WinApi.GWL_EXSTYLE);
-        if ((exStyle & WinApi.WS_EX_TOOLWINDOW) != 0)
-            return false;
-
-        var sb = GetSharedStringBuilder(128);
-        WinApi.GetClassName(hwnd, sb, sb.Capacity);
-        string cls = sb.ToString();
-        className = cls;
-
-        if (cls is "TaskManagerWindow" or "CabinetWClass" or "Notepad")
-            return true;
-
-        if (cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or
-            "Windows.UI.Core.CoreWindow" or "DV2ControlHost" or "MsgrIMEWindowClass" or "SysShadow" or
-            "TaskListThumbnailWnd" or "SideBar_HTMLHostWindow" or "XamlExplorerHostIslandWindow" or
-            "PopupHost" or "Droplist" or "tooltips_class32" or "#32768")
-        {
-            return false;
-        }
-
-        if (WinApi.GetWindowRect(hwnd, out WinApi.RECT rc))
-        {
-            int w = rc.Right - rc.Left;
-            int h = rc.Bottom - rc.Top;
-            if (w < 120 || h < 100) return false;
-        }
-
-        return true;
-    }
+    // ───────────────────────────── Persistence ─────────────────────────────
 
     private static void LoadRules()
     {
@@ -640,10 +762,13 @@ internal static class Program
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Log($"[ERROR] Failed to load rules: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
-    // Optimization 6 & 8: Source-generated JSON + non-blocking OS timer debounce + atomic config save
+    // Source-generated JSON + non-blocking OS timer debounce + atomic config save
     private static readonly System.Threading.Timer _saveTimer = new(_ => SaveRules(), null, Timeout.Infinite, Timeout.Infinite);
     private static readonly object _saveLock = new();
 
@@ -653,7 +778,7 @@ internal static class Program
         {
             _saveTimer.Change(2000, Timeout.Infinite);
         }
-        catch { }
+        catch (ObjectDisposedException) { } // shutting down; final SaveRules() runs in Main
     }
 
     private static void SaveRules()
@@ -670,7 +795,10 @@ internal static class Program
                 File.WriteAllText(tmpPath, json);
                 File.Move(tmpPath, ConfigPath, overwrite: true);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log($"[ERROR] Failed to save rules: {ex.GetType().Name}: {ex.Message}");
+            }
         }
     }
 
@@ -700,7 +828,10 @@ internal static class Program
                 key.DeleteValue("ReScale", false);
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Log($"[ERROR] Failed to update auto-start: {ex.Message}");
+        }
     }
 
     private class MessageOnlyWindow : NativeWindow, IDisposable
@@ -724,8 +855,8 @@ internal static class Program
                     IntPtr fg = WinApi.GetForegroundWindow();
                     if (fg != IntPtr.Zero)
                     {
-                        NormalizeWindowDpi(fg, force: true);
-                        _trayIcon?.ShowBalloonTip(1000, "ReScale", "Normalized active window.", ToolTipIcon.Info);
+                        bool res = NormalizeWindowDpi(fg, force: true);
+                        _trayIcon?.ShowBalloonTip(1000, "ReScale", res ? "Normalized active window." : "Active window can't be normalized (not a resizable app window).", ToolTipIcon.Info);
                     }
                 }
                 else if (id == HOTKEY_ID_ALL)
@@ -745,11 +876,16 @@ internal static class Program
     }
 }
 
-public class WindowDpiRule
+/// <summary>
+/// SavedWidth/SavedHeight/SavedDpi = the user's real size, anchored at the DPI it was set on (only changed by a
+/// genuine user resize). LastAppliedDpi = the DPI the window was last scaled to / known to be at (0 = never scaled).
+/// </summary>
+public record WindowDpiRule
 {
     public int SavedWidth { get; set; }
     public int SavedHeight { get; set; }
     public uint SavedDpi { get; set; } = 96;
+    public uint LastAppliedDpi { get; set; }
     public DateTime LastUpdatedUtc { get; set; } = DateTime.UtcNow;
 }
 
@@ -775,16 +911,30 @@ internal static class WinApi
     public const uint WINEVENT_OUTOFCONTEXT = 0;
     public const uint WINEVENT_SKIPOWNPROCESS = 2;
 
+    public const int GWL_STYLE = -16;
     public const int GWL_EXSTYLE = -20;
+    public const int WS_CHILD = 0x40000000;
+    public const int WS_VISIBLE = 0x10000000;
+    public const int WS_MINIMIZE = 0x20000000;
+    public const int WS_THICKFRAME = 0x00040000;
     public const int WS_EX_TOOLWINDOW = 0x00000080;
+    public const int WS_EX_APPWINDOW = 0x00040000;
+    public const int WS_EX_NOACTIVATE = 0x08000000;
+
+    public const uint GA_ROOT = 2;
+    public const uint GW_OWNER = 4;
+    public const int DWMWA_CLOAKED = 14;
 
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_ASYNCWINDOWPOS = 0x4000;
 
     public const int SW_SHOWNORMAL = 1;
 
     public const uint MONITOR_DEFAULTTONEAREST = 2;
     public const int MDT_EFFECTIVE_DPI = 0;
+
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
     public delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -815,30 +965,25 @@ internal static class WinApi
         public uint dwFlags;
     }
 
-    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-
     [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
     [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
-    [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll", ExactSpelling = true)] public static extern int GetWindowLongW(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll", ExactSpelling = true)] public static extern unsafe int GetClassNameW(IntPtr hWnd, char* lpClassName, int nMaxCount);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
-    [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+    [DllImport("user32.dll", ExactSpelling = true)] public static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFO lpmi);
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
-    [DllImport("kernel32.dll")] public static extern uint GetLastError();
-    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto)] public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+    [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll", ExactSpelling = true)] public static extern unsafe bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, char* lpExeName, ref int lpdwSize);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr hObject);
-    [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
-    [DllImport("kernel32.dll")] public static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
 }
