@@ -112,6 +112,8 @@ internal static class Program
 
     private static readonly object _logLock = new();
     private const long MaxLogBytes = 256 * 1024; // 256 KB max log size
+    private static long _logSize = -1; // tracked in memory; -1 = not yet read from disk
+    private static int _pruneThreshold = 64;
 
     private static void Log(string msg)
     {
@@ -119,16 +121,26 @@ internal static class Program
         {
             try
             {
-                var fi = new FileInfo(LogPath);
-                if (fi.Exists && fi.Length > MaxLogBytes)
+                // Read the file size from disk once, then track it in memory (no stat call per log line)
+                if (_logSize < 0)
+                {
+                    var fi = new FileInfo(LogPath);
+                    _logSize = fi.Exists ? fi.Length : 0;
+                }
+
+                if (_logSize > MaxLogBytes)
                 {
                     string[] lines = File.ReadAllLines(LogPath);
                     int skip = lines.Length / 2;
                     File.WriteAllLines(LogPath, lines[skip..]);
+                    _logSize = new FileInfo(LogPath).Length;
                 }
-                File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+
+                string line = $"[{DateTime.Now:HH:mm:ss}] {msg}\n";
+                File.AppendAllText(LogPath, line);
+                _logSize += Encoding.UTF8.GetByteCount(line);
             }
-            catch { }
+            catch { _logSize = -1; }
         }
     }
 
@@ -280,12 +292,15 @@ internal static class Program
         if (_handledOnShow.ContainsKey(hwnd)) return;
         if (!IsCandidateAppWindow(hwnd)) return;
 
-        if (_handledOnShow.Count > 64)
+        // Prune closed handles only when the set has doubled since the last prune,
+        // so many open windows don't trigger an O(n) sweep on every new window.
+        if (_handledOnShow.Count >= _pruneThreshold)
         {
             foreach (var key in _handledOnShow.Keys)
             {
                 if (!WinApi.IsWindow(key)) _handledOnShow.TryRemove(key, out _);
             }
+            _pruneThreshold = Math.Max(64, _handledOnShow.Count * 2);
         }
 
         if (_handledOnShow.TryAdd(hwnd, true))
@@ -372,11 +387,15 @@ internal static class Program
 
                 if (ok)
                 {
-                    // Calibrate rule to the new monitor DPI so it stays untouched while on this monitor
-                    rule.SavedWidth = targetW;
-                    rule.SavedHeight = targetH;
-                    rule.SavedDpi = currentDpi;
-                    rule.LastUpdatedUtc = DateTime.UtcNow;
+                    // Calibrate rule to the new monitor DPI so it stays untouched while on this monitor.
+                    // Replace the rule object atomically (never mutate in place) so a concurrent save never sees a half-updated rule.
+                    _rules[procName] = new WindowDpiRule
+                    {
+                        SavedWidth = targetW,
+                        SavedHeight = targetH,
+                        SavedDpi = currentDpi,
+                        LastUpdatedUtc = DateTime.UtcNow
+                    };
                     SaveRulesDebounced();
 
                     Log($"[SUCCESS] Scaled {procName} for DPI change: {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {dpiRatio:F2})");
