@@ -228,6 +228,15 @@ internal static class Program
 
                 if (w > 120 && h > 100)
                 {
+                    // Optimization 1: Skip redundant rule updates, logging, and disk writes if size & DPI haven't changed (window was just moved)
+                    if (_rules.TryGetValue(procName, out var existingRule) &&
+                        existingRule.SavedWidth == w &&
+                        existingRule.SavedHeight == h &&
+                        existingRule.SavedDpi == dpi)
+                    {
+                        return;
+                    }
+
                     _rules[procName] = new WindowDpiRule
                     {
                         SavedWidth = w,
