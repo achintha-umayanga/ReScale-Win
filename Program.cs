@@ -47,6 +47,7 @@ internal static class Program
     private readonly record struct PidEntry(string? Name, long Tick);
     private static readonly ConcurrentDictionary<uint, PidEntry> _pidCache = new();
     private const long PidCacheTtlMs = 30_000;
+    private static int _pidPruneThreshold = 256;
     private static readonly uint _ownPid = (uint)Environment.ProcessId;
 
     // Shell / system hosts that must never be resized or learned.
@@ -61,6 +62,7 @@ internal static class Program
     private const int HOTKEY_ID_ALL = 9002;
 
     private enum Candidate { Reject, NotReady, Ok }
+    public enum NormalizeResult { NotCandidate, LearnedInitial, AlreadyMatching, Scaled, Failed }
 
     [STAThread]
     private static void Main()
@@ -77,6 +79,9 @@ internal static class Program
         LoadRules();
 
         _msgWindow = new MessageOnlyWindow();
+
+        // SystemEvents owns a hidden top-level broadcast-receiving window (HWND_MESSAGE windows do not receive WM_DISPLAYCHANGE).
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
 
         // Hotkeys: Ctrl+Alt+S (Active window), Ctrl+Alt+A (All windows)
         if (!WinApi.RegisterHotKey(_msgWindow.Handle, HOTKEY_ID_ACTIVE, WinApi.MOD_CONTROL | WinApi.MOD_ALT, (uint)Keys.S))
@@ -109,6 +114,7 @@ internal static class Program
         Application.Run();
 
         // Cleanup
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         _saveTimer.Dispose();
         SaveRules();
         if (_hookMoveSize != IntPtr.Zero) WinApi.UnhookWinEvent(_hookMoveSize);
@@ -124,6 +130,8 @@ internal static class Program
         GC.KeepAlive(_moveSizeDelegate);
         GC.KeepAlive(_showDelegate);
     }
+
+    private static void OnDisplaySettingsChanged(object? sender, EventArgs e) => OnDisplayTopologyChanged();
 
     private static readonly bool _isAdmin = CheckIsRunningAsAdmin();
     private static bool IsRunningAsAdmin() => _isAdmin;
@@ -194,6 +202,19 @@ internal static class Program
         return (Icon)SystemIcons.Application.Clone();
     }
 
+    private static void ShowActiveWindowBalloon(NormalizeResult res)
+    {
+        string text = res switch
+        {
+            NormalizeResult.Scaled          => "Normalized active window size.",
+            NormalizeResult.AlreadyMatching => "Window already matches active monitor.",
+            NormalizeResult.LearnedInitial  => "Recorded current window size for this monitor.",
+            NormalizeResult.Failed          => "Could not resize window (check activity log).",
+            _                               => "Active window can't be normalized (not a resizable app window)."
+        };
+        _trayIcon?.ShowBalloonTip(1000, "ReScale", text, res == NormalizeResult.Failed ? ToolTipIcon.Warning : ToolTipIcon.Info);
+    }
+
     private static void SetupTrayIcon()
     {
         _trayMenu = new ContextMenuStrip();
@@ -212,8 +233,7 @@ internal static class Program
             IntPtr hwnd = WinApi.GetForegroundWindow();
             if (hwnd != IntPtr.Zero)
             {
-                bool res = NormalizeWindowDpi(hwnd, force: true);
-                _trayIcon?.ShowBalloonTip(1000, "ReScale", res ? "Normalized active window size." : "Window already matches active monitor.", ToolTipIcon.Info);
+                ShowActiveWindowBalloon(NormalizeWindowDpi(hwnd, force: true));
             }
         });
 
@@ -329,6 +349,7 @@ internal static class Program
 
         IntPtr monitor = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
         uint dpi = GetMonitorDpi(monitor);
+        bool hasWorkArea = GetWorkArea(monitor, out var work);
 
         if (_rules.TryGetValue(procName, out var existing))
         {
@@ -337,7 +358,7 @@ internal static class Program
             {
                 if (existing.LastAppliedDpi != 0 && existing.LastAppliedDpi != dpi)
                 {
-                    _rules[procName] = existing with { LastAppliedDpi = dpi };
+                    _rules[procName] = existing with { LastAppliedDpi = dpi, LastUpdatedUtc = DateTime.UtcNow };
                     SaveRulesDebounced();
                 }
                 return;
@@ -351,7 +372,7 @@ internal static class Program
                 var (ew, eh) = ScaleRule(existing, dpi);
                 bool matchesScaled = Within(w, ew, 0.02) && Within(h, eh, 0.02);
                 bool matchesClamped = false;
-                if (GetWorkArea(monitor, out var work))
+                if (hasWorkArea)
                 {
                     int cw = Math.Min(ew, (work.Right - work.Left) - 20);
                     int ch = Math.Min(eh, (work.Bottom - work.Top) - 20);
@@ -362,12 +383,21 @@ internal static class Program
                 {
                     if (existing.LastAppliedDpi != dpi)
                     {
-                        _rules[procName] = existing with { LastAppliedDpi = dpi };
+                        _rules[procName] = existing with { LastAppliedDpi = dpi, LastUpdatedUtc = DateTime.UtcNow };
                         SaveRulesDebounced();
                     }
                     return;
                 }
             }
+        }
+
+        // Ignore Aero Snap / Win+Arrow snapped sizes (half-screen or quadrant snaps report SW_SHOWNORMAL).
+        if (hasWorkArea)
+        {
+            int ww = work.Right - work.Left, wh = work.Bottom - work.Top;
+            bool fullOrHalfW = Within(w, ww, 0.03) || Within(w, ww / 2, 0.03);
+            bool fullOrHalfH = Within(h, wh, 0.03) || Within(h, wh / 2, 0.03);
+            if (fullOrHalfW && fullOrHalfH) return; // snapped, not a deliberate free-floating size
         }
 
         // A genuine user resize: re-anchor to the user's real size on this DPI.
@@ -444,26 +474,26 @@ internal static class Program
     /// If it is on the same DPI, it leaves the window completely untouched, unless it came back
     /// at the size ReScale gave it on another monitor (then it is restored to the user's real size).
     /// </summary>
-    public static bool NormalizeWindowDpi(IntPtr hwnd, bool force)
+    public static NormalizeResult NormalizeWindowDpi(IntPtr hwnd, bool force)
     {
-        if (Classify(hwnd, out string? specialProc) != Candidate.Ok) return false;
+        if (Classify(hwnd, out string? specialProc) != Candidate.Ok) return NormalizeResult.NotCandidate;
 
         var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
-        if (!WinApi.GetWindowPlacement(hwnd, ref wp)) return false;
+        if (!WinApi.GetWindowPlacement(hwnd, ref wp)) return NormalizeResult.NotCandidate;
 
         // Only handle normal (restored down) windows
-        if (wp.showCmd != WinApi.SW_SHOWNORMAL) return false;
+        if (wp.showCmd != WinApi.SW_SHOWNORMAL) return NormalizeResult.NotCandidate;
 
         string? procName = specialProc ?? ResolveProcessName(hwnd);
-        if (procName == null || ExcludedProcesses.Contains(procName)) return false;
+        if (procName == null || ExcludedProcesses.Contains(procName)) return NormalizeResult.NotCandidate;
 
         IntPtr monitor = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
         uint currentDpi = GetMonitorDpi(monitor);
-        if (!GetWorkArea(monitor, out var work)) return false;
+        if (!GetWorkArea(monitor, out var work)) return NormalizeResult.NotCandidate;
         int workW = work.Right - work.Left;
         int workH = work.Bottom - work.Top;
 
-        if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect)) return false;
+        if (!WinApi.GetWindowRect(hwnd, out WinApi.RECT currentRect)) return NormalizeResult.NotCandidate;
         int curW = currentRect.Right - currentRect.Left;
         int curH = currentRect.Bottom - currentRect.Top;
 
@@ -473,12 +503,12 @@ internal static class Program
             {
                 // CRITICAL CHECK:
                 // On the SAME DPI where the size was saved, DO NOT TOUCH the window...
-                if (rule.LastAppliedDpi == 0 || rule.LastAppliedDpi == rule.SavedDpi) return false;
+                if (rule.LastAppliedDpi == 0 || rule.LastAppliedDpi == rule.SavedDpi) return NormalizeResult.AlreadyMatching;
 
                 // ...unless it came back at the size we scaled it to on another DPI (stale scaled size).
                 // One matching dimension is enough because the other may have been clamped to a smaller work area.
                 var (pw, ph) = ScaleRule(rule, rule.LastAppliedDpi);
-                if (!Within(curW, pw, 0.08) && !Within(curH, ph, 0.08)) return false;
+                if (!Within(curW, pw, 0.08) && !Within(curH, ph, 0.08)) return NormalizeResult.AlreadyMatching;
             }
 
             // Target is always derived from the user's anchored size, so 96 -> 144 -> 96 returns to the exact original.
@@ -487,18 +517,18 @@ internal static class Program
             // Clamp only the on-screen placement. The anchor in the rule is never overwritten with clamped values.
             targetW = Math.Min(targetW, workW - 20);
             targetH = Math.Min(targetH, workH - 20);
-            if (targetW <= 0 || targetH <= 0) return false;
+            if (targetW <= 0 || targetH <= 0) return NormalizeResult.NotCandidate;
 
             // Only adjust if the window size differs meaningfully from target scaled size
-            if (!force && Within(curW, targetW, 0.08) && Within(curH, targetH, 0.08))
+            if (Within(curW, targetW, force ? 0.01 : 0.08) && Within(curH, targetH, force ? 0.01 : 0.08))
             {
                 // Already correct for this DPI; remember where it is so a later return is recognized.
                 if (rule.LastAppliedDpi != currentDpi && currentDpi != rule.SavedDpi)
                 {
-                    _rules[procName] = rule with { LastAppliedDpi = currentDpi };
+                    _rules[procName] = rule with { LastAppliedDpi = currentDpi, LastUpdatedUtc = DateTime.UtcNow };
                     SaveRulesDebounced();
                 }
-                return false;
+                return NormalizeResult.AlreadyMatching;
             }
 
             int x = currentRect.Left;
@@ -518,19 +548,19 @@ internal static class Program
             {
                 // Anchor (SavedWidth/Height/Dpi) stays untouched; only record which DPI we applied.
                 // Replace the rule object atomically (never mutate in place) so a concurrent save never sees a half-updated rule.
-                _rules[procName] = rule with { LastAppliedDpi = currentDpi };
+                _rules[procName] = rule with { LastAppliedDpi = currentDpi, LastUpdatedUtc = DateTime.UtcNow };
                 SaveRulesDebounced();
 
                 double ratio = currentDpi / (double)(rule.SavedDpi > 0 ? rule.SavedDpi : 96);
                 Log($"[SUCCESS] Scaled {procName} for DPI change: {curW}x{curH} -> {targetW}x{targetH} (DPI {currentDpi}, Ratio: {ratio:F2})");
+                return NormalizeResult.Scaled;
             }
             else
             {
                 int err = Marshal.GetLastWin32Error();
                 Log($"[WARN] SetWindowPos failed for {procName} (Error: {err})");
+                return NormalizeResult.Failed;
             }
-
-            return ok;
         }
 
         // First time seeing this window: learn its size on this monitor's DPI
@@ -546,9 +576,10 @@ internal static class Program
             };
             Log($"Recorded initial size for {procName}: {curW}x{curH} on DPI {currentDpi}");
             SaveRulesDebounced();
+            return NormalizeResult.LearnedInitial;
         }
 
-        return false;
+        return NormalizeResult.NotCandidate;
     }
 
     public static int NormalizeAllWindows()
@@ -556,7 +587,7 @@ internal static class Program
         int count = 0;
         WinApi.EnumWindows((hwnd, lParam) =>
         {
-            if (NormalizeWindowDpi(hwnd, force: false))
+            if (NormalizeWindowDpi(hwnd, force: false) == NormalizeResult.Scaled)
             {
                 count++;
             }
@@ -569,22 +600,29 @@ internal static class Program
     private static int _topologyChangeVersion = 0;
     public static void OnDisplayTopologyChanged()
     {
-        // Coalesce rapid-fire WM_DISPLAYCHANGE events when plugging/unplugging monitors
+        // Coalesce rapid-fire DisplaySettingsChanged events when plugging/unplugging monitors
         int version = Interlocked.Increment(ref _topologyChangeVersion);
         _handledOnShow.Clear();
 
         Task.Run(async () =>
         {
-            await Task.Delay(500);
-            if (Volatile.Read(ref _topologyChangeVersion) != version) return;
+            try
+            {
+                await Task.Delay(500).ConfigureAwait(false);
+                if (Volatile.Read(ref _topologyChangeVersion) != version) return;
 
-            Log("Display topology changed (monitor connect/disconnect).");
-            NormalizeAllWindows();
+                Log("Display topology changed (monitor connect/disconnect).");
+                NormalizeAllWindows();
 
-            await Task.Delay(1000);
-            if (Volatile.Read(ref _topologyChangeVersion) != version) return;
+                await Task.Delay(1000).ConfigureAwait(false);
+                if (Volatile.Read(ref _topologyChangeVersion) != version) return;
 
-            NormalizeAllWindows();
+                NormalizeAllWindows();
+            }
+            catch (Exception ex)
+            {
+                Log($"[ERROR] Display topology handler failed: {ex.Message}");
+            }
         });
     }
 
@@ -693,27 +731,49 @@ internal static class Program
 
     /// <summary>
     /// Resolves the owning process name via OpenProcess + QueryFullProcessImageNameW, cached per PID with a TTL.
-    /// Failures are cached too (null), so protected processes are not re-queried on every event.
-    /// There is deliberately no Process.GetProcessById fallback: if PROCESS_QUERY_LIMITED_INFORMATION is denied,
-    /// the process is protected and its windows could not be resized anyway.
+    /// For UWP apps hosted inside ApplicationFrameHost.exe, resolves the real app process from its CoreWindow child.
     /// </summary>
     private static string? ResolveProcessName(IntPtr hwnd)
     {
         WinApi.GetWindowThreadProcessId(hwnd, out uint pid);
         if (pid == 0 || pid == _ownPid) return null;
 
+        string? name = LookupProcessNameByPid(pid);
+
+        // UWP / WinUI apps hosted by ApplicationFrameHost.exe: resolve the real app from its CoreWindow child
+        // so Calculator, Settings, Photos, etc. each get their own rule instead of sharing ApplicationFrameHost.
+        if (string.Equals(name, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase))
+        {
+            IntPtr coreWnd = WinApi.FindWindowExW(hwnd, IntPtr.Zero, "Windows.UI.Core.CoreWindow", null);
+            if (coreWnd != IntPtr.Zero)
+            {
+                WinApi.GetWindowThreadProcessId(coreWnd, out uint childPid);
+                if (childPid != 0 && childPid != pid && childPid != _ownPid)
+                {
+                    string? realName = LookupProcessNameByPid(childPid);
+                    if (!string.IsNullOrEmpty(realName)) return realName;
+                }
+            }
+        }
+
+        return name;
+    }
+
+    private static string? LookupProcessNameByPid(uint pid)
+    {
         long now = Environment.TickCount64;
         if (_pidCache.TryGetValue(pid, out var entry) && now - entry.Tick < PidCacheTtlMs)
             return entry.Name;
 
         string? name = QueryProcessName(pid);
 
-        if (_pidCache.Count > 256)
+        if (_pidCache.Count >= _pidPruneThreshold)
         {
             foreach (var kvp in _pidCache)
             {
                 if (now - kvp.Value.Tick >= PidCacheTtlMs) _pidCache.TryRemove(kvp.Key, out _);
             }
+            _pidPruneThreshold = Math.Max(256, _pidCache.Count * 2);
         }
         _pidCache[pid] = new PidEntry(name, now);
         return name;
@@ -843,11 +903,7 @@ internal static class Program
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WinApi.WM_DISPLAYCHANGE)
-            {
-                OnDisplayTopologyChanged();
-            }
-            else if (m.Msg == WinApi.WM_HOTKEY)
+            if (m.Msg == WinApi.WM_HOTKEY)
             {
                 int id = m.WParam.ToInt32();
                 if (id == HOTKEY_ID_ACTIVE)
@@ -855,8 +911,7 @@ internal static class Program
                     IntPtr fg = WinApi.GetForegroundWindow();
                     if (fg != IntPtr.Zero)
                     {
-                        bool res = NormalizeWindowDpi(fg, force: true);
-                        _trayIcon?.ShowBalloonTip(1000, "ReScale", res ? "Normalized active window." : "Active window can't be normalized (not a resizable app window).", ToolTipIcon.Info);
+                        ShowActiveWindowBalloon(NormalizeWindowDpi(fg, force: true));
                     }
                 }
                 else if (id == HOTKEY_ID_ALL)
@@ -882,11 +937,11 @@ internal static class Program
 /// </summary>
 public record WindowDpiRule
 {
-    public int SavedWidth { get; set; }
-    public int SavedHeight { get; set; }
-    public uint SavedDpi { get; set; } = 96;
-    public uint LastAppliedDpi { get; set; }
-    public DateTime LastUpdatedUtc { get; set; } = DateTime.UtcNow;
+    public int SavedWidth { get; init; }
+    public int SavedHeight { get; init; }
+    public uint SavedDpi { get; init; } = 96;
+    public uint LastAppliedDpi { get; init; }
+    public DateTime LastUpdatedUtc { get; init; } = DateTime.UtcNow;
 }
 
 [JsonSourceGenerationOptions(WriteIndented = true)]
@@ -899,7 +954,6 @@ internal partial class ReScaleJsonContext : JsonSerializerContext
 
 internal static class WinApi
 {
-    public const int WM_DISPLAYCHANGE = 0x007E;
     public const int WM_HOTKEY = 0x0312;
     public static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 
@@ -974,6 +1028,7 @@ internal static class WinApi
     [DllImport("user32.dll", ExactSpelling = true)] public static extern int GetWindowLongW(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr hWndParent, IntPtr hWndChildAfter, string? lpszClass, string? lpszWindow);
     [DllImport("user32.dll", ExactSpelling = true)] public static extern unsafe int GetClassNameW(IntPtr hWnd, char* lpClassName, int nMaxCount);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
