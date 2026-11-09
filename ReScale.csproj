@@ -9,6 +9,8 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <TieredPGO>true</TieredPGO>
+    <OptimizationPreference>Speed</OptimizationPreference>
     <AssemblyName>ReScale</AssemblyName>
     <RootNamespace>ReScale</RootNamespace>
     <Version>1.0.0</Version>

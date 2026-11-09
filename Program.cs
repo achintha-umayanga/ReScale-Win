@@ -7,6 +7,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -610,7 +611,7 @@ internal static class Program
             if (File.Exists(ConfigPath))
             {
                 string json = File.ReadAllText(ConfigPath);
-                var loaded = JsonSerializer.Deserialize<Dictionary<string, WindowDpiRule>>(json);
+                var loaded = JsonSerializer.Deserialize(json, ReScaleJsonContext.Default.DictionaryStringWindowDpiRule);
                 if (loaded != null)
                 {
                     foreach (var kvp in loaded)
@@ -623,8 +624,7 @@ internal static class Program
         catch { }
     }
 
-    // Optimization 6: Cached JsonSerializerOptions + non-blocking OS timer debounce + atomic config save
-    private static readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
+    // Optimization 6 & 8: Source-generated JSON + non-blocking OS timer debounce + atomic config save
     private static readonly System.Threading.Timer _saveTimer = new(_ => SaveRules(), null, Timeout.Infinite, Timeout.Infinite);
     private static readonly object _saveLock = new();
 
@@ -646,7 +646,7 @@ internal static class Program
                 string dir = Path.GetDirectoryName(ConfigPath)!;
                 if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
 
-                string json = JsonSerializer.Serialize(_rules, _jsonOptions);
+                string json = JsonSerializer.Serialize(_rules, ReScaleJsonContext.Default.ConcurrentDictionaryStringWindowDpiRule);
                 string tmpPath = ConfigPath + ".tmp";
                 File.WriteAllText(tmpPath, json);
                 File.Move(tmpPath, ConfigPath, overwrite: true);
@@ -732,6 +732,14 @@ public class WindowDpiRule
     public int SavedHeight { get; set; }
     public uint SavedDpi { get; set; } = 96;
     public DateTime LastUpdatedUtc { get; set; } = DateTime.UtcNow;
+}
+
+[JsonSourceGenerationOptions(WriteIndented = true)]
+[JsonSerializable(typeof(Dictionary<string, WindowDpiRule>))]
+[JsonSerializable(typeof(ConcurrentDictionary<string, WindowDpiRule>))]
+[JsonSerializable(typeof(WindowDpiRule))]
+internal partial class ReScaleJsonContext : JsonSerializerContext
+{
 }
 
 internal static class WinApi
