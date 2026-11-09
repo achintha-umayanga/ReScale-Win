@@ -257,7 +257,18 @@ internal static class Program
     /// </summary>
     private static void OnWindowShow(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
-        if (idObject != 0 || hwnd == IntPtr.Zero || !IsCandidateAppWindow(hwnd)) return;
+        // Optimization 3: Fast integer & memory lookup BEFORE making Win32 P/Invoke calls or allocations
+        if (idObject != 0 || idChild != 0 || hwnd == IntPtr.Zero) return;
+        if (_handledOnShow.ContainsKey(hwnd)) return;
+        if (!IsCandidateAppWindow(hwnd)) return;
+
+        if (_handledOnShow.Count > 64)
+        {
+            foreach (var key in _handledOnShow.Keys)
+            {
+                if (!WinApi.IsWindow(key)) _handledOnShow.TryRemove(key, out _);
+            }
+        }
 
         if (_handledOnShow.TryAdd(hwnd, true))
         {
