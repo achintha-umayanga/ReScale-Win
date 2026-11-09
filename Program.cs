@@ -327,6 +327,16 @@ internal static class Program
         return ok && work.Right > work.Left && work.Bottom > work.Top;
     }
 
+    /// <summary>True when <paramref name="w"/>x<paramref name="h"/> matches a full- or half-screen Aero Snap / Win+Arrow snap.</summary>
+    private static bool IsSnappedSize(int w, int h, WinApi.RECT work)
+    {
+        int ww = work.Right - work.Left, wh = work.Bottom - work.Top;
+        if (ww <= 0 || wh <= 0) return false;
+        bool fullOrHalfW = Within(w, ww, 0.03) || Within(w, ww / 2, 0.03);
+        bool fullOrHalfH = Within(h, wh, 0.03) || Within(h, wh / 2, 0.03);
+        return fullOrHalfW && fullOrHalfH;
+    }
+
     /// <summary>
     /// Event: User manually moved or resized a window.
     /// Record the window's physical dimensions along with the exact DPI of the monitor it sits on.
@@ -392,13 +402,7 @@ internal static class Program
         }
 
         // Ignore Aero Snap / Win+Arrow snapped sizes (half-screen or quadrant snaps report SW_SHOWNORMAL).
-        if (hasWorkArea)
-        {
-            int ww = work.Right - work.Left, wh = work.Bottom - work.Top;
-            bool fullOrHalfW = Within(w, ww, 0.03) || Within(w, ww / 2, 0.03);
-            bool fullOrHalfH = Within(h, wh, 0.03) || Within(h, wh / 2, 0.03);
-            if (fullOrHalfW && fullOrHalfH) return; // snapped, not a deliberate free-floating size
-        }
+        if (hasWorkArea && IsSnappedSize(w, h, work)) return;
 
         // A genuine user resize: re-anchor to the user's real size on this DPI.
         _rules[procName] = new WindowDpiRule
@@ -424,20 +428,20 @@ internal static class Program
         if (_handledOnShow.TryGetValue(hwnd, out long last) && now - last < ShowCooldownMs) return;
 
         // Cheap structural filter first (style bits reject child windows before anything else).
-        // NotReady (cloaked / still tiny) still gets scheduled so the retry loop can pick it up.
+        // NotReady (cloaked / still tiny / UWP awaiting CoreWindow) still gets scheduled so the retry loop can pick it up.
         if (Classify(hwnd, out _) == Candidate.Reject) return;
 
         _handledOnShow[hwnd] = now;
 
         // Prune by age (no IsWindow calls). Only when the map has doubled since the last prune,
         // and every entry expires after the cooldown, so the map cannot grow without bound.
-        if (_handledOnShow.Count >= _pruneThreshold)
+        if (_handledOnShow.Count >= Volatile.Read(ref _pruneThreshold))
         {
             foreach (var kvp in _handledOnShow)
             {
                 if (now - kvp.Value >= ShowCooldownMs) _handledOnShow.TryRemove(kvp.Key, out _);
             }
-            _pruneThreshold = Math.Max(64, _handledOnShow.Count * 2);
+            Volatile.Write(ref _pruneThreshold, Math.Max(64, _handledOnShow.Count * 2));
         }
 
         _ = NormalizeAfterLaunchAsync(hwnd);
@@ -563,8 +567,8 @@ internal static class Program
             }
         }
 
-        // First time seeing this window: learn its size on this monitor's DPI
-        if (curW > 120 && curH > 100)
+        // First time seeing this window: learn its size on this monitor's DPI (unless it's currently snapped)
+        if (curW > 120 && curH > 100 && !IsSnappedSize(curW, curH, work))
         {
             _rules[procName] = new WindowDpiRule
             {
@@ -645,6 +649,8 @@ internal static class Program
                 if (w > 120 && h > 100)
                 {
                     IntPtr mon = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
+                    if (GetWorkArea(mon, out var work) && IsSnappedSize(w, h, work)) return true;
+
                     uint dpi = GetMonitorDpi(mon);
 
                     _rules[procName] = new WindowDpiRule
@@ -677,7 +683,7 @@ internal static class Program
     /// <summary>
     /// Single-pass window filter, cheapest checks first. Allocation-free (class name is read into a stack buffer).
     /// Ok       = top-level, resizable, unowned app window that is visible and uncloaked.
-    /// NotReady = structurally valid but cloaked or still tiny (launching); worth retrying shortly.
+    /// NotReady = structurally valid but cloaked, still tiny, or UWP frame awaiting its CoreWindow child; worth retrying shortly.
     /// Reject   = never a candidate.
     /// <paramref name="specialProc"/> is set for well-known shell classes whose process name is fixed.
     /// </summary>
@@ -709,6 +715,12 @@ internal static class Program
         if (cls is "TaskManagerWindow") specialProc = "Taskmgr";
         else if (cls is "CabinetWClass") specialProc = "explorer";
         else if (cls is "Notepad") specialProc = "notepad";
+        else if (cls is "ApplicationFrameWindow")
+        {
+            // UWP / WinUI host frame: if its CoreWindow child hasn't been created yet (still launching), wait and retry.
+            if (WinApi.FindWindowExW(hwnd, IntPtr.Zero, "Windows.UI.Core.CoreWindow", null) == IntPtr.Zero)
+                return Candidate.NotReady;
+        }
         else if (cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "Shell_SecondaryTrayWnd" or
                  "Windows.UI.Core.CoreWindow" or "DV2ControlHost" or "MsgrIMEWindowClass" or "SysShadow" or
                  "TaskListThumbnailWnd" or "SideBar_HTMLHostWindow" or "XamlExplorerHostIslandWindow" or
@@ -754,6 +766,7 @@ internal static class Program
                     if (!string.IsNullOrEmpty(realName)) return realName;
                 }
             }
+            return null; // couldn't resolve the real app: don't learn or resize under the shared host name
         }
 
         return name;
@@ -767,13 +780,13 @@ internal static class Program
 
         string? name = QueryProcessName(pid);
 
-        if (_pidCache.Count >= _pidPruneThreshold)
+        if (_pidCache.Count >= Volatile.Read(ref _pidPruneThreshold))
         {
             foreach (var kvp in _pidCache)
             {
                 if (now - kvp.Value.Tick >= PidCacheTtlMs) _pidCache.TryRemove(kvp.Key, out _);
             }
-            _pidPruneThreshold = Math.Max(256, _pidCache.Count * 2);
+            Volatile.Write(ref _pidPruneThreshold, Math.Max(256, _pidCache.Count * 2));
         }
         _pidCache[pid] = new PidEntry(name, now);
         return name;
@@ -866,8 +879,15 @@ internal static class Program
     {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", false);
-            return key?.GetValue("ReScale") != null;
+            using var proc = Process.Start(new ProcessStartInfo("schtasks", "/Query /TN \"ReScale\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            });
+            proc?.WaitForExit(3000);
+            return proc?.ExitCode == 0;
         }
         catch { return false; }
     }
@@ -876,16 +896,36 @@ internal static class Program
     {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true);
-            if (key == null) return;
+            // Clean up any legacy HKCU\...\Run value (ignored by Windows when manifest has requireAdministrator)
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true);
+                key?.DeleteValue("ReScale", false);
+            }
+            catch { }
+
+            string args;
             if (enable)
             {
                 string exePath = Environment.ProcessPath ?? Application.ExecutablePath;
-                key.SetValue("ReScale", $"\"{exePath}\"");
+                args = $"/Create /F /TN \"ReScale\" /SC ONLOGON /RL HIGHEST /TR \"\\\"{exePath}\\\"\"";
             }
             else
             {
-                key.DeleteValue("ReScale", false);
+                args = "/Delete /F /TN \"ReScale\"";
+            }
+
+            using var proc = Process.Start(new ProcessStartInfo("schtasks", args)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            });
+            proc?.WaitForExit(3000);
+            if (proc != null && proc.ExitCode != 0 && enable)
+            {
+                Log($"[WARN] schtasks failed with exit code {proc.ExitCode}: {proc.StandardError.ReadToEnd().Trim()}");
             }
         }
         catch (Exception ex)
