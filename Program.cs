@@ -76,6 +76,9 @@ internal static class Program
         // Learn sizes of existing open windows without altering them
         InitialScanOpenWindows();
 
+        // Optimization 7: Trim startup working set pages before entering idle tray message loop
+        try { WinApi.SetProcessWorkingSetSize(WinApi.GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1)); } catch { }
+
         Application.Run();
 
         // Cleanup
@@ -92,7 +95,10 @@ internal static class Program
         _trayIcon?.Dispose();
     }
 
-    private static bool IsRunningAsAdmin()
+    private static readonly bool _isAdmin = CheckIsRunningAsAdmin();
+    private static bool IsRunningAsAdmin() => _isAdmin;
+
+    private static bool CheckIsRunningAsAdmin()
     {
         try
         {
@@ -103,13 +109,26 @@ internal static class Program
         catch { return false; }
     }
 
+    private static readonly object _logLock = new();
+    private const long MaxLogBytes = 256 * 1024; // 256 KB max log size
+
     private static void Log(string msg)
     {
-        try
+        lock (_logLock)
         {
-            File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+            try
+            {
+                var fi = new FileInfo(LogPath);
+                if (fi.Exists && fi.Length > MaxLogBytes)
+                {
+                    string[] lines = File.ReadAllLines(LogPath);
+                    int skip = lines.Length / 2;
+                    File.WriteAllLines(LogPath, lines[skip..]);
+                }
+                File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+            }
+            catch { }
         }
-        catch { }
     }
 
     private static void SetupTrayIcon()
@@ -793,4 +812,6 @@ internal static class WinApi
     [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
     [DllImport("kernel32.dll", CharSet = CharSet.Auto)] public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref int lpdwSize);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] public static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
 }
