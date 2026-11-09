@@ -208,45 +208,42 @@ internal static class Program
     /// </summary>
     private static void OnMoveSizeEnd(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
-        if (idObject != 0 || hwnd == IntPtr.Zero || !IsCandidateAppWindow(hwnd)) return;
+        if (idObject != 0 || hwnd == IntPtr.Zero || !IsCandidateAppWindow(hwnd, out string cls)) return;
 
         var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
-        if (!WinApi.GetWindowPlacement(hwnd, ref wp)) return;
+        if (!WinApi.GetWindowPlacement(hwnd, ref wp) || wp.showCmd != WinApi.SW_SHOWNORMAL) return;
 
-        string? procName = GetProcessName(hwnd);
+        string? procName = GetProcessName(hwnd, cls);
         if (string.IsNullOrEmpty(procName)) return;
 
         IntPtr monitor = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
         uint dpi = GetMonitorDpi(monitor);
 
-        if (wp.showCmd == WinApi.SW_SHOWNORMAL)
+        if (WinApi.GetWindowRect(hwnd, out WinApi.RECT rc))
         {
-            if (WinApi.GetWindowRect(hwnd, out WinApi.RECT rc))
+            int w = rc.Right - rc.Left;
+            int h = rc.Bottom - rc.Top;
+
+            if (w > 120 && h > 100)
             {
-                int w = rc.Right - rc.Left;
-                int h = rc.Bottom - rc.Top;
-
-                if (w > 120 && h > 100)
+                // Optimization 1: Skip redundant rule updates, logging, and disk writes if size & DPI haven't changed (window was just moved)
+                if (_rules.TryGetValue(procName, out var existingRule) &&
+                    existingRule.SavedWidth == w &&
+                    existingRule.SavedHeight == h &&
+                    existingRule.SavedDpi == dpi)
                 {
-                    // Optimization 1: Skip redundant rule updates, logging, and disk writes if size & DPI haven't changed (window was just moved)
-                    if (_rules.TryGetValue(procName, out var existingRule) &&
-                        existingRule.SavedWidth == w &&
-                        existingRule.SavedHeight == h &&
-                        existingRule.SavedDpi == dpi)
-                    {
-                        return;
-                    }
-
-                    _rules[procName] = new WindowDpiRule
-                    {
-                        SavedWidth = w,
-                        SavedHeight = h,
-                        SavedDpi = dpi,
-                        LastUpdatedUtc = DateTime.UtcNow
-                    };
-                    Log($"Learned size for {procName}: {w}x{h} on DPI {dpi}");
-                    SaveRulesDebounced();
+                    return;
                 }
+
+                _rules[procName] = new WindowDpiRule
+                {
+                    SavedWidth = w,
+                    SavedHeight = h,
+                    SavedDpi = dpi,
+                    LastUpdatedUtc = DateTime.UtcNow
+                };
+                Log($"Learned size for {procName}: {w}x{h} on DPI {dpi}");
+                SaveRulesDebounced();
             }
         }
     }
@@ -289,16 +286,16 @@ internal static class Program
     /// </summary>
     public static bool NormalizeWindowDpi(IntPtr hwnd, bool force)
     {
-        if (!IsCandidateAppWindow(hwnd)) return false;
-
-        string? procName = GetProcessName(hwnd);
-        if (string.IsNullOrEmpty(procName)) return false;
+        if (!IsCandidateAppWindow(hwnd, out string cls)) return false;
 
         var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
         if (!WinApi.GetWindowPlacement(hwnd, ref wp)) return false;
 
         // Only handle normal (restored down) windows
         if (wp.showCmd != WinApi.SW_SHOWNORMAL) return false;
+
+        string? procName = GetProcessName(hwnd, cls);
+        if (string.IsNullOrEmpty(procName)) return false;
 
         IntPtr monitor = WinApi.MonitorFromWindow(hwnd, WinApi.MONITOR_DEFAULTTONEAREST);
         uint currentDpi = GetMonitorDpi(monitor);
@@ -402,12 +399,9 @@ internal static class Program
         int count = 0;
         WinApi.EnumWindows((hwnd, lParam) =>
         {
-            if (IsCandidateAppWindow(hwnd))
+            if (NormalizeWindowDpi(hwnd, force: false))
             {
-                if (NormalizeWindowDpi(hwnd, force: false))
-                {
-                    count++;
-                }
+                count++;
             }
             return true;
         }, IntPtr.Zero);
@@ -441,13 +435,13 @@ internal static class Program
     {
         WinApi.EnumWindows((hwnd, lParam) =>
         {
-            if (IsCandidateAppWindow(hwnd))
+            if (IsCandidateAppWindow(hwnd, out string cls))
             {
-                string? procName = GetProcessName(hwnd);
-                if (!string.IsNullOrEmpty(procName) && !_rules.ContainsKey(procName))
+                var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
+                if (WinApi.GetWindowPlacement(hwnd, ref wp) && wp.showCmd == WinApi.SW_SHOWNORMAL)
                 {
-                    var wp = new WinApi.WINDOWPLACEMENT { length = Marshal.SizeOf<WinApi.WINDOWPLACEMENT>() };
-                    if (WinApi.GetWindowPlacement(hwnd, ref wp) && wp.showCmd == WinApi.SW_SHOWNORMAL)
+                    string? procName = GetProcessName(hwnd, cls);
+                    if (!string.IsNullOrEmpty(procName) && !_rules.ContainsKey(procName))
                     {
                         if (WinApi.GetWindowRect(hwnd, out WinApi.RECT rc))
                         {
@@ -485,11 +479,15 @@ internal static class Program
         return 96;
     }
 
-    private static string? GetProcessName(IntPtr hwnd)
+    private static string? GetProcessName(IntPtr hwnd, string? className = null)
     {
-        var sb = new StringBuilder(128);
-        WinApi.GetClassName(hwnd, sb, sb.Capacity);
-        string cls = sb.ToString();
+        string cls = className ?? string.Empty;
+        if (string.IsNullOrEmpty(cls))
+        {
+            var sb = new StringBuilder(128);
+            WinApi.GetClassName(hwnd, sb, sb.Capacity);
+            cls = sb.ToString();
+        }
 
         if (cls == "TaskManagerWindow") return "Taskmgr";
         if (cls == "CabinetWClass") return "explorer";
@@ -508,8 +506,11 @@ internal static class Program
         }
     }
 
-    private static bool IsCandidateAppWindow(IntPtr hwnd)
+    private static bool IsCandidateAppWindow(IntPtr hwnd) => IsCandidateAppWindow(hwnd, out _);
+
+    private static bool IsCandidateAppWindow(IntPtr hwnd, out string className)
     {
+        className = string.Empty;
         if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowVisible(hwnd) || WinApi.IsIconic(hwnd))
             return false;
 
@@ -520,6 +521,7 @@ internal static class Program
         var sb = new StringBuilder(128);
         WinApi.GetClassName(hwnd, sb, sb.Capacity);
         string cls = sb.ToString();
+        className = cls;
 
         if (cls is "TaskManagerWindow" or "CabinetWClass" or "Notepad")
             return true;
