@@ -404,15 +404,24 @@ internal static class Program
         return count;
     }
 
+    private static int _topologyChangeVersion = 0;
     public static void OnDisplayTopologyChanged()
     {
+        // Optimization 2: Coalesce rapid-fire WM_DISPLAYCHANGE events when plugging/unplugging monitors
+        int version = Interlocked.Increment(ref _topologyChangeVersion);
         _handledOnShow.Clear();
-        Log("Display topology changed (monitor connect/disconnect).");
+
         Task.Run(async () =>
         {
             await Task.Delay(500);
+            if (Volatile.Read(ref _topologyChangeVersion) != version) return;
+
+            Log("Display topology changed (monitor connect/disconnect).");
             NormalizeAllWindows();
+
             await Task.Delay(1000);
+            if (Volatile.Read(ref _topologyChangeVersion) != version) return;
+
             NormalizeAllWindows();
         });
     }
