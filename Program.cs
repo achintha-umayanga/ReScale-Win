@@ -479,12 +479,31 @@ internal static class Program
         return 96;
     }
 
+    [ThreadStatic]
+    private static StringBuilder? _sharedSb;
+
+    private static StringBuilder GetSharedStringBuilder(int minCapacity = 260)
+    {
+        var sb = _sharedSb;
+        if (sb == null)
+        {
+            sb = new StringBuilder(minCapacity);
+            _sharedSb = sb;
+        }
+        else
+        {
+            sb.Clear();
+            if (sb.Capacity < minCapacity) sb.EnsureCapacity(minCapacity);
+        }
+        return sb;
+    }
+
     private static string? GetProcessName(IntPtr hwnd, string? className = null)
     {
         string cls = className ?? string.Empty;
         if (string.IsNullOrEmpty(cls))
         {
-            var sb = new StringBuilder(128);
+            var sb = GetSharedStringBuilder(128);
             WinApi.GetClassName(hwnd, sb, sb.Capacity);
             cls = sb.ToString();
         }
@@ -493,10 +512,30 @@ internal static class Program
         if (cls == "CabinetWClass") return "explorer";
         if (cls == "Notepad") return "notepad";
 
+        WinApi.GetWindowThreadProcessId(hwnd, out uint pid);
+        if (pid == 0) return null;
+
+        // Optimization 5: Fast native QueryFullProcessImageName lookup (avoids heavy Process.GetProcessById allocations & exceptions)
+        IntPtr hProc = WinApi.OpenProcess(WinApi.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (hProc != IntPtr.Zero)
+        {
+            try
+            {
+                var sb = GetSharedStringBuilder(260);
+                int capacity = sb.Capacity;
+                if (WinApi.QueryFullProcessImageName(hProc, 0, sb, ref capacity) && capacity > 0)
+                {
+                    return Path.GetFileNameWithoutExtension(sb.ToString());
+                }
+            }
+            finally
+            {
+                WinApi.CloseHandle(hProc);
+            }
+        }
+
         try
         {
-            WinApi.GetWindowThreadProcessId(hwnd, out uint pid);
-            if (pid == 0) return null;
             using var proc = Process.GetProcessById((int)pid);
             return proc.ProcessName;
         }
@@ -518,7 +557,7 @@ internal static class Program
         if ((exStyle & WinApi.WS_EX_TOOLWINDOW) != 0)
             return false;
 
-        var sb = new StringBuilder(128);
+        var sb = GetSharedStringBuilder(128);
         WinApi.GetClassName(hwnd, sb, sb.Capacity);
         string cls = sb.ToString();
         className = cls;
@@ -724,6 +763,8 @@ internal static class WinApi
         public uint dwFlags;
     }
 
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
     [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
     [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -734,7 +775,7 @@ internal static class WinApi
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-    [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
@@ -743,4 +784,7 @@ internal static class WinApi
     [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
     [DllImport("kernel32.dll")] public static extern uint GetLastError();
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)] public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr hObject);
 }
